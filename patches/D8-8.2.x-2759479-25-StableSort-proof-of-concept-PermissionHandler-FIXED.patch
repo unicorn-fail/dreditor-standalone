@@ -1,0 +1,3260 @@
+diff --git a/core/includes/common.inc b/core/includes/common.inc
+index 037c5b0..a227ae0 100644
+--- a/core/includes/common.inc
++++ b/core/includes/common.inc
+@@ -12,6 +12,7 @@
+ use Drupal\Component\Utility\Bytes;
+ use Drupal\Component\Utility\Html;
+ use Drupal\Component\Utility\SortArray;
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Component\Utility\UrlHelper;
+ use Drupal\Core\Cache\Cache;
+ use Drupal\Core\Render\Element\Link;
+@@ -1270,7 +1271,7 @@ function drupal_get_updaters() {
+   if (!isset($updaters)) {
+     $updaters = \Drupal::moduleHandler()->invokeAll('updater_info');
+     \Drupal::moduleHandler()->alter('updater_info', $updaters);
+-    uasort($updaters, array(SortArray::class, 'sortByWeightElement'));
++    $updaters = StableSort::sortMixedByWeightKey($updaters);
+   }
+   return $updaters;
+ }
+@@ -1290,7 +1291,7 @@ function drupal_get_filetransfer_info() {
+   if (!isset($info)) {
+     $info = \Drupal::moduleHandler()->invokeAll('filetransfer_info');
+     \Drupal::moduleHandler()->alter('filetransfer_info', $info);
+-    uasort($info, array(SortArray::class, 'sortByWeightElement'));
++    $info = StableSort::sortMixedByWeightKey($info);
+   }
+   return $info;
+ }
+diff --git a/core/includes/update.inc b/core/includes/update.inc
+index 2c020db..12ae51a 100644
+--- a/core/includes/update.inc
++++ b/core/includes/update.inc
+@@ -9,6 +9,7 @@
+  */
+ 
+ use Drupal\Component\Graph\Graph;
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Utility\Error;
+ 
+ /**
+@@ -400,7 +401,7 @@ function update_resolve_dependencies($starting_updates) {
+   // Perform the depth-first search and sort on the results.
+   $graph_object = new Graph($graph);
+   $graph = $graph_object->searchAndSort();
+-  uasort($graph, array('Drupal\Component\Utility\SortArray', 'sortByWeightElement'));
++  $graph = StableSort::sortMixedByWeightKey($graph);
+ 
+   foreach ($graph as $function => &$data) {
+     $module = $data['module'];
+diff --git a/core/lib/Drupal/Component/Utility/SortArray.php b/core/lib/Drupal/Component/Utility/SortArray.php
+index 044a214..7649cf0 100644
+--- a/core/lib/Drupal/Component/Utility/SortArray.php
++++ b/core/lib/Drupal/Component/Utility/SortArray.php
+@@ -3,7 +3,16 @@
+ namespace Drupal\Component\Utility;
+ 
+ /**
+- * Provides generic array sorting helper methods.
++ * Provides comparison callbacks for array sorting with e.g. uasort().
++ *
++ * The methods should really be called compare*() instead of sort*(). The same
++ * can be said about the class name. But since renaming would be an API break,
++ * it is not going to happen.
++ *
++ * Most of the code that currently uses these methods can soon be changed to use
++ * dedicated sort-by-weight methods instead.
++ *
++ * @see \Drupal\Component\Utility\StableSort
+  *
+  * @ingroup utility
+  */
+diff --git a/core/lib/Drupal/Component/Utility/StableSort.php b/core/lib/Drupal/Component/Utility/StableSort.php
+new file mode 100644
+index 0000000..e1833d0
+--- /dev/null
++++ b/core/lib/Drupal/Component/Utility/StableSort.php
+@@ -0,0 +1,515 @@
++<?php
++
++namespace Drupal\Component\Utility;
++
++/**
++ * Provides "stable" (*) sort functions based on item weights.
++ *
++ * The sort order is based on one or more weights determined from each item.
++ *
++ * (*) How "stable" is the sorting?
++ *
++ * Relative order of items with the same weight is preserved.
++ *
++ * The sort is "stable", if, with the given sort flags, for any two weights
++ * $w0 and $w1 with (string)$w0 !== (string)$w1, either $w0 < $w1 or $w1 < $w0.
++ *
++ * E.g. non-canonical string representations of float weights like '0.0' or
++ * '0.00' in combination with SORT_NUMERIC can lead to non-stable sorting.
++ *
++ * The class is "final" until someone can point out a convincing use case for
++ * inheritance.
++ */
++final class StableSort {
++
++  /**
++   * Determines a "neutral weight" based on sort flags, to be used as a fallback
++   * for items without an explicit weight.
++   *
++   * @param int|null $sort_flags
++   *   Either SORT_NUMERIC or SORT_STRING.
++   *
++   * @return int|string
++   *   The "neutral weight".
++   */
++  public static function sortFlagsGetNeutralWeight($sort_flags) {
++    if ($sort_flags === SORT_NUMERIC) {
++      return 0;
++    }
++    else {
++      return '';
++    }
++  }
++
++  /**
++   * Sorts an array of values.
++   *
++   * Keys of the original array are preserved, similar to PHP's native asort().
++   * Relative order of keys with equal values is preserved.
++   *
++   * @param mixed[] $values_unsorted
++   *   Array of values to be sorted. The values should be strings or numbers, or
++   *   anything that can be cleanly converted to string with (string)$value.
++   * @param int $sort_flags
++   *   (optional) One of the PHP sort flags, e.g. SORT_NUMERIC or SORT_STRING.
++   *   Unlike most of the other methods, this one also supports other sort flags
++   *   like SORT_REGULAR etc.
++   * @param int $sort_direction
++   *   (optional) Either SORT_ASC or SORT_DESC.
++   *
++   * @return mixed[]
++   *   Sorted values.
++   */
++  public static function sortByValue(array $values_unsorted, $sort_flags = SORT_NUMERIC, $sort_direction = SORT_ASC) {
++
++    // An empty array would cause range() to return a non-empty array.
++    // A one-valued array does not need to be sorted.
++    if (count($values_unsorted) < 2) {
++      return $values_unsorted;
++    }
++
++    $range = range(0, count($values_unsorted) - 1);
++    $keys = array_keys($values_unsorted);
++    array_multisort($values_unsorted, $sort_flags, $sort_direction, $range, $keys);
++
++    return array_combine($keys, $values_unsorted);
++  }
++
++  /**
++   * Sorts an array of possible arrays by weight key.
++   *
++   * Keys of the original array are preserved, similar to PHP's native asort().
++   * Relative order of items with the same weight is preserved.
++   *
++   * @param array[]|mixed[] $items_unsorted
++   *   Array of possible arrays to be sorted.
++   *   Each item may or may not have a value (weight) at $item[$weight_key].
++   *   Any such weight must be numeric, or a string.
++   * @param string|int $weight_key
++   *   The key to determine a weight for each item.
++   * @param int $sort_flags
++   *   (optional) Sort flags for PHP's native ksort() function.
++   *   Currently only SORT_NUMERIC or SORT_STRING are supported.
++   * @param int $sort_direction
++   *   (optional) Either SORT_ASC or SORT_DESC.
++   *
++   * @return array[]|mixed[]
++   *   Sorted arrays.
++   */
++  public static function sortMixedByWeightKey(array $items_unsorted, $weight_key = 'weight', $sort_flags = SORT_NUMERIC, $sort_direction = SORT_ASC) {
++
++    // An empty array would cause range() to return a non-empty array.
++    // A one-valued array does not need to be sorted.
++    if (count($items_unsorted) < 2) {
++      return $items_unsorted;
++    }
++
++    $neutral_weight = self::sortFlagsGetNeutralWeight($sort_flags);
++
++    $weights = [];
++    foreach ($items_unsorted as $k => $item) {
++      $weights[] = (is_array($item) && isset($item[$weight_key]))
++        ? $item[$weight_key]
++        : $neutral_weight;
++    }
++
++    return self::sortByWeightsNonEmpty($items_unsorted, $weights, $sort_flags, $sort_direction);
++  }
++
++  /**
++   * Sorts an array of arrays by weight key.
++   *
++   * Unlike sortMixedByWeightKey(), this function does not call array_exists() for
++   * each item. If it is already known that all items are arrays, this function
++   * should be used for performance benefits.
++   *
++   * Keys of the original array are preserved, similar to PHP's native asort().
++   * Relative order of items with the same weight is preserved.
++   *
++   * @param array[] $items_unsorted
++   *   Array of arrays to be sorted.
++   *   Each item may or may not have a value (weight) at $item[$weight_key].
++   *   Any such weight must be numeric, or a string.
++   * @param string|int $weight_key
++   *   The key to determine a weight for each item.
++   * @param int $sort_flags
++   *   (optional) Sort flags for PHP's native ksort() function.
++   *   Currently only SORT_NUMERIC or SORT_STRING are supported.
++   * @param int $sort_direction
++   *   (optional) Either SORT_ASC or SORT_DESC.
++   *
++   * @return array[]
++   *   Sorted arrays.
++   */
++  public static function sortArraysByWeightKey(array $items_unsorted, $weight_key = 'weight', $sort_flags = SORT_NUMERIC, $sort_direction = SORT_ASC) {
++
++    // An empty array would cause range() to return a non-empty array.
++    // A one-valued array does not need to be sorted.
++    if (count($items_unsorted) < 2) {
++      return $items_unsorted;
++    }
++
++    $neutral_weight = self::sortFlagsGetNeutralWeight($sort_flags);
++
++    // Use the slower algorithm with array_multisort().
++    $weights = [];
++    foreach ($items_unsorted as $k => $item) {
++      $weights[] = isset($item[$weight_key])
++        ? $item[$weight_key]
++        : $neutral_weight;
++    }
++
++    return self::sortByWeightsNonEmpty($items_unsorted, $weights, $sort_flags, $sort_direction);
++  }
++
++  /**
++   * Sorts an array of arbitrary items by a weight determined with a callback.
++   *
++   * Keys of the original array are preserved, similar to PHP's native asort().
++   * Relative order of items with the same weight is preserved.
++   *
++   * @param mixed[] $items_unsorted
++   * @param callable $weight_callback
++   *   Callback to determine a weight for each item.
++   * @param int $sort_flags
++   *   (optional) One of the PHP sort flags, e.g. SORT_NUMERIC or SORT_STRING.
++   *   Unlike most of the other methods, this one also supports other sort flags
++   *   like SORT_REGULAR etc.
++   * @param int $sort_direction
++   *   (optional) Either SORT_ASC or SORT_DESC.
++   *
++   * @return array|mixed
++   */
++  public static function sortByWeightCallback(array $items_unsorted, $weight_callback, $sort_flags = SORT_NUMERIC, $sort_direction = SORT_ASC) {
++
++    // An empty array would cause range() to return a non-empty array.
++    // A one-valued array does not need to be sorted.
++    if (count($items_unsorted) < 2) {
++      return $items_unsorted;
++    }
++
++    // Use the slower algorithm with array_multisort().
++    $weights = array_map($weight_callback, $items_unsorted);
++
++    return self::sortByWeightsNonEmpty($items_unsorted, $weights, $sort_flags, $sort_direction);
++  }
++
++  /**
++   * Sorts items by an array of weights.
++   *
++   * @param mixed[] $items_unsorted
++   *   Format: $[$k] = $item
++   * @param int[]|float[]|string[]|mixed[] $weights_assoc
++   *   Associative array of weights, with same keys as $items_unsorted.
++   *   Format: $[$k] = $weight
++   * @param int $sort_flags
++   *   E.g. SORT_NUMERIC or SORT_STRING.
++   * @param int $sort_direction
++   *
++   * @return mixed[]
++   *   Sorted items.
++   *   Format: $[$k] === $items_unsorted[$k]
++   */
++  public static function sortByWeightsAssoc(array $items_unsorted, $weights_assoc, $sort_flags = SORT_NUMERIC, $sort_direction = SORT_ASC) {
++
++    // An empty array would cause range() to return a non-empty array.
++    // A one-valued array does not need to be sorted.
++    if (count($items_unsorted) < 2) {
++      return $items_unsorted;
++    }
++
++    $neutral_weight = self::sortFlagsGetNeutralWeight($sort_flags);
++
++    $weights = [];
++    foreach ($items_unsorted as $k => $_) {
++      $weights[] = isset($weights_assoc[$k]) ? $weights_assoc[$k] : $neutral_weight;
++    }
++
++    return self::sortByWeightsNonEmpty($items_unsorted, $weights, $sort_flags, $sort_direction);
++  }
++
++  /**
++   * Sorts items by an array of weights.
++   *
++   * @param mixed[] $items_unsorted
++   *   Format: $[$k] = $item
++   * @param int[]|float[]|string[]|mixed[] $weights
++   *   Sequentially indexed array of weights.
++   *   Format: $[] = $weight
++   *   Must have same count as the items.
++   * @param int $sort_flags
++   *   E.g. SORT_NUMERIC or SORT_STRING.
++   * @param int $sort_direction
++   *
++   * @return mixed[]
++   *   Sorted items.
++   *   Format: $[$k] === $items_unsorted[$k]
++   */
++  public static function sortByWeights(array $items_unsorted, array $weights, $sort_flags, $sort_direction = SORT_ASC) {
++
++    // An empty array would cause range() to return a non-empty array.
++    // A one-valued array does not need to be sorted.
++    if (count($items_unsorted) < 2) {
++      return $items_unsorted;
++    }
++
++    return self::sortByWeightsNonEmpty($items_unsorted, $weights, $sort_flags, $sort_direction);
++  }
++
++  /**
++   * Sorts items by an array of weights.
++   *
++   * @param mixed[] $items_unsorted
++   *   Array of items to be sorted.
++   *   The array *must not* be empty.
++   * @param int[]|float[]|string[]|mixed[] $weights
++   *   Must have same count as the items.
++   * @param int $sort_flags
++   *   E.g. SORT_NUMERIC or SORT_STRING.
++   * @param int $sort_direction
++   *
++   * @return mixed[]
++   *   Sorted items.
++   *   Format: $[$k] === $items_unsorted[$k]
++   */
++  private static function sortByWeightsNonEmpty(array $items_unsorted, array $weights, $sort_flags, $sort_direction = SORT_ASC) {
++
++    $keys = array_keys($items_unsorted);
++    $range = range(0, count($items_unsorted) - 1);
++
++    array_multisort($weights, $sort_flags, $sort_direction, $range, SORT_NUMERIC, $keys, $items_unsorted);
++
++    return array_combine($keys, $items_unsorted);
++  }
++
++  /**
++   * Sorts an array of arrays by multiple weight keys.
++   *
++   * Keys of the original array are preserved, similar to PHP's native asort().
++   * Relative order of items with the same weight is preserved.
++   *
++   * @param array[] $items_unsorted
++   *   Array of arrays to be sorted.
++   *   Each item may or may not have a value (weight) at $item[$weight_key].
++   *   Any such weight must be numeric, or a string.
++   * @param int[] $sort_flags_by_weight_key
++   *   List of sort criteria, highest precedence first.
++   *   Format: $[$weight_key] = $sort_flags
++   *   E.g. ['weight' => SORT_NUMERIC, 'title' => SORT_STRING].
++   *   Currently only SORT_NUMERIC or SORT_STRING are supported.
++   * @param int[] $sort_directions
++   *   (optional) Sort direction for each weight key. If not specified, SORT_ASC
++   *   is assumed.
++   *   E.g. ['title' => SORT_DESC]
++   *
++   * @return array[]
++   *   Sorted arrays.
++   */
++  public static function sortMixedByWeightKeys(array $items_unsorted, array $sort_flags_by_weight_key, array $sort_directions = []) {
++
++    // An empty array would cause range() to return a non-empty array.
++    // A one-valued array does not need to be sorted.
++    if (count($items_unsorted) < 2) {
++      return $items_unsorted;
++    }
++
++    $rows = [];
++    foreach ($items_unsorted as $k => $item) {
++      $rows[] = is_array($item) ? $item : [];
++    }
++
++    $args = self::arraysBuildMultisortArgs($rows, $sort_flags_by_weight_key, $sort_directions);
++
++    return self::sortByMultisortArgsNonEmpty($items_unsorted, $args);
++  }
++
++  /**
++   * Sorts an array of arrays by multiple weight keys.
++   *
++   * Keys of the original array are preserved, similar to PHP's native asort().
++   * Relative order of items with the same weight is preserved.
++   *
++   * @param array[] $items_unsorted
++   *   Array of arrays to be sorted.
++   *   Each item may or may not have a value (weight) at $item[$weight_key].
++   *   Any such weight must be numeric, or a string.
++   * @param int[] $sort_flags_by_weight_key
++   *   List of sort criteria, highest precedence first.
++   *   Format: $[$weight_key] = $sort_flags
++   *   E.g. ['weight' => SORT_NUMERIC, 'title' => SORT_STRING].
++   *   Currently only SORT_NUMERIC or SORT_STRING are supported.
++   * @param int[] $sort_directions
++   *   (optional) Sort direction for each weight key. If not specified, SORT_ASC
++   *   is assumed.
++   *   E.g. ['title' => SORT_DESC]
++   *
++   * @return array[]
++   *   Sorted arrays.
++   */
++  public static function sortArraysByWeightKeys(array $items_unsorted, array $sort_flags_by_weight_key, array $sort_directions = []) {
++
++    // An empty array would cause range() to return a non-empty array.
++    // A one-valued array does not need to be sorted.
++    if (count($items_unsorted) < 2) {
++      return $items_unsorted;
++    }
++
++    $args = self::arraysBuildMultisortArgs($items_unsorted, $sort_flags_by_weight_key, $sort_directions);
++
++    return self::sortByMultisortArgsNonEmpty($items_unsorted, $args);
++  }
++
++  /**
++   * @param mixed[] $items_unsorted
++   *   Array of items to be sorted.
++   * @param callable $weights_callback
++   *   Callback that returns an array of weights for a given item.
++   * @param array $sort_flags_by_weight_key
++   * @param array $sort_directions
++   *
++   * @return mixed[]
++   */
++  public static function sortByWeightsCallback(array $items_unsorted, $weights_callback, array $sort_flags_by_weight_key, array $sort_directions = []) {
++
++    // An empty array would cause range() to return a non-empty array.
++    // A one-valued array does not need to be sorted.
++    if (count($items_unsorted) < 2) {
++      return $items_unsorted;
++    }
++
++    $weight_rows = array_map($weights_callback, $items_unsorted);
++
++    $args = self::arraysBuildMultisortArgs($weight_rows, $sort_flags_by_weight_key, $sort_directions);
++
++    return self::sortByMultisortArgsNonEmpty($items_unsorted, $args);
++  }
++
++  /**
++   * Builds a part of the arguments for array_multisort().
++   *
++   * @param array[] $weight_rows
++   *   Format: $[] = ['weight' => .., 'title' => .., ..]
++   * @param int[] $sort_flags_by_weight_key
++   * @param int[] $sort_directions
++   *
++   * @return mixed[]
++   *   Format: E.g. [$weights, SORT_NUMERIC, $titles, SORT_STRING, SORT_DESC]
++   *
++   * @see ::sortByMultisortArgs()
++   */
++  public static function arraysBuildMultisortArgs(array $weight_rows, array $sort_flags_by_weight_key, array $sort_directions = []) {
++
++    $args = [];
++    foreach ($sort_flags_by_weight_key as $weight_key => $sort_flags) {
++      $neutral_weight = self::sortFlagsGetNeutralWeight($sort_flags);
++      $weights = [];
++      foreach ($weight_rows as $k => $weight_row) {
++        $weights[] = isset($weight_row[$weight_key]) ? $weight_row[$weight_key] : $neutral_weight;
++      }
++      $args[] = $weights;
++      if (SORT_REGULAR !== $sort_flags) {
++        $args[] = $sort_flags;
++      }
++      if (isset($sort_directions[$weight_key]) && SORT_DESC === $sort_directions[$weight_key]) {
++        $args[] = SORT_DESC;
++      }
++    }
++
++    return $args;
++  }
++
++  /**
++   * Sorts items by array_multisort() arguments.
++   *
++   * @param mixed[] $items_unsorted
++   *   Items to be sorted.
++   * @param mixed[] $multisort_args
++   *   Partial argument list for array_multisort, containing weight lists.
++   *   E.g. [$weights_0, SORT_REGULAR, SORT_ASC, $weights_1, SORT_NATURAL, SORT_DESC]
++   *
++   * @return mixed[]
++   */
++  public static function sortByMultisortArgs(array $items_unsorted, array $multisort_args) {
++
++    // An empty array would cause range() to return a non-empty array.
++    // A one-valued array does not need to be sorted.
++    if (count($items_unsorted) < 2) {
++      return $items_unsorted;
++    }
++
++    return self::sortByMultisortArgsNonEmpty($items_unsorted, $multisort_args);
++  }
++
++  /**
++   * Sorts items by array_multisort() arguments.
++   *
++   * @param array $items_unsorted
++   *   Items to be sorted.
++   * @param mixed[] $multisort_args
++   *   Partial argument list for array_multisort, containing weight lists.
++   *   E.g. [$weights_0, SORT_REGULAR, SORT_ASC, $weights_1, SORT_NATURAL, SORT_DESC]
++   *
++   * @return array
++   */
++  private static function sortByMultisortArgsNonEmpty(array $items_unsorted, array $multisort_args) {
++
++    $multisort_args[] = range(0, count($items_unsorted) - 1);
++    $keys = array_keys($items_unsorted);
++    $multisort_args[] =& $keys;
++    $multisort_args[] =& $items_unsorted;
++
++    call_user_func_array('array_multisort', $multisort_args);
++
++    return array_combine($keys, $items_unsorted);
++  }
++
++  /**
++   * Sorts and merges items that were previously grouped by weight.
++   *
++   * Keys of the original array are preserved, similar to PHP's native asort().
++   * Relative order of items with the same weight is preserved.
++   *
++   * If a key occurs in more than one group, the current implementation will let
++   * the first occurence win. This behavior is not a guaranteed for future
++   * implementations.
++   *
++   * The method mostly serves as a helper method for the other sort methods
++   * within this class, but it can also be used by custom sort methods outside
++   * this class.
++   *
++   * @param mixed[][] $items_by_weight
++   *   Items grouped by weight.
++   *   Format: $[$weight][$key] = $item
++   * @param int $sort_flags
++   *   (optional) One of the PHP sort flags, e.g. SORT_NUMERIC or SORT_STRING.
++   * @param int $sort_direction
++   *   (optional) Either SORT_ASC or SORT_DESC.
++   *
++   * @return mixed[]
++   *   Items sorted by weight.
++   *   Format: $[$key] = $item
++   */
++  public static function ksortAndMergeGroups(array $items_by_weight, $sort_flags = SORT_NUMERIC, $sort_direction = SORT_ASC) {
++
++    // Sort by weight.
++    if ($sort_direction === SORT_ASC) {
++      ksort($items_by_weight, $sort_flags);
++    }
++    elseif ($sort_direction === SORT_DESC) {
++      krsort($items_by_weight, $sort_flags);
++    }
++    else {
++      $sort_direction_export = var_export($sort_direction, TRUE);
++      throw new \InvalidArgumentException("Sort direction must be either SORT_ASC or SORT_DESC, $sort_direction_export found instead.");
++    }
++
++    // Merge the groups.
++    $items_sorted = [];
++    foreach ($items_by_weight as $weight => $items_in_group) {
++      $items_sorted += $items_in_group;
++    }
++
++    return $items_sorted;
++  }
++
++}
+diff --git a/core/lib/Drupal/Core/Asset/AssetResolver.php b/core/lib/Drupal/Core/Asset/AssetResolver.php
+index 9e1bcce..7c23600 100644
+--- a/core/lib/Drupal/Core/Asset/AssetResolver.php
++++ b/core/lib/Drupal/Core/Asset/AssetResolver.php
+@@ -4,6 +4,7 @@
+ 
+ use Drupal\Component\Utility\Crypt;
+ use Drupal\Component\Utility\NestedArray;
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Cache\CacheBackendInterface;
+ use Drupal\Core\Extension\ModuleHandlerInterface;
+ use Drupal\Core\Language\LanguageManagerInterface;
+@@ -145,10 +146,6 @@ public function getCssAssets(AttachedAssetsInterface $assets, $optimize) {
+             $options['preprocess'] = FALSE;
+           }
+ 
+-          // Always add a tiny value to the weight, to conserve the insertion
+-          // order.
+-          $options['weight'] += count($css) / 1000;
+-
+           // CSS files are being keyed by the full path.
+           $css[$options['data']] = $options;
+         }
+@@ -160,7 +157,7 @@ public function getCssAssets(AttachedAssetsInterface $assets, $optimize) {
+     $this->themeManager->alter('css', $css, $assets);
+ 
+     // Sort CSS items, so that they appear in the correct order.
+-    uasort($css, 'static::sort');
++    $css = static::sortAssets($css);
+ 
+     // Allow themes to remove CSS files by CSS files full path and file name.
+     // @todo Remove in Drupal 9.0.x.
+@@ -277,7 +274,7 @@ public function getJsAssets(AttachedAssetsInterface $assets, $optimize) {
+       $this->themeManager->alter('js', $javascript, $assets);
+ 
+       // Sort JavaScript assets, so that they appear in the correct order.
+-      uasort($javascript, 'static::sort');
++      $javascript = static::sortAssets($javascript);
+ 
+       // Prepare the return value: filter JavaScript assets per scope.
+       $js_assets_header = [];
+@@ -354,7 +351,7 @@ public function getJsAssets(AttachedAssetsInterface $assets, $optimize) {
+   }
+ 
+   /**
+-   * Sorts CSS and JavaScript resources.
++   * Compares two CSS or JavaScript resources ("assets").
+    *
+    * This sort order helps optimize front-end performance while providing
+    * modules and themes with the necessary control for ordering the CSS and
+@@ -367,6 +364,8 @@ public function getJsAssets(AttachedAssetsInterface $assets, $optimize) {
+    *   Second item for comparison.
+    *
+    * @return int
++   *
++   * @deprecated Use self::sortAssets() instead.
+    */
+   public static function sort($a, $b) {
+     // First order by group, so that all items in the CSS_AGGREGATE_DEFAULT
+@@ -390,4 +389,28 @@ public static function sort($a, $b) {
+     }
+   }
+ 
++  /**
++   * Sorts an array of CSS or Javscript resources ("assets").
++   *
++   * @param array[] $assets_unsorted
++   *   Unsorted assets.
++   *   Format: $[$key] = ['group' => .., 'weight' => .., ..]
++   *
++   * @return array[]
++   *   Sorted assets.
++   *   Format: $[$key] = ['group' => .., 'weight' => .., ..]
++   */
++  public static function sortAssets(array $assets_unsorted) {
++    // @todo Specify that 'group' has to be numeric.
++    return StableSort::sortArraysByWeightKeys(
++      $assets_unsorted,
++      [
++        // First order by group, so that all items in the CSS_AGGREGATE_DEFAULT
++        // group appear before items in the CSS_AGGREGATE_THEME group. Modules
++        // may create additional groups by defining their own constants.
++        'group' => SORT_NUMERIC,
++        'weight' => SORT_NUMERIC,
++      ]);
++  }
++
+ }
+diff --git a/core/lib/Drupal/Core/Config/Entity/ConfigDependencyManager.php b/core/lib/Drupal/Core/Config/Entity/ConfigDependencyManager.php
+index c274f28..66b5285 100644
+--- a/core/lib/Drupal/Core/Config/Entity/ConfigDependencyManager.php
++++ b/core/lib/Drupal/Core/Config/Entity/ConfigDependencyManager.php
+@@ -4,6 +4,7 @@
+ 
+ use Drupal\Component\Graph\Graph;
+ use Drupal\Component\Utility\SortArray;
++use Drupal\Component\Utility\StableSort;
+ 
+ /**
+  * Provides a class to discover configuration entity dependencies.
+@@ -174,7 +175,10 @@ public function getDependentEntities($type, $name) {
+     // always after field storages. This is because field storages need to be
+     // created before a field.
+     $graph = $this->getGraph();
+-    uasort($graph, array($this, 'sortGraph'));
++    $graph = StableSort::sortArraysByWeightKeys(
++      $graph,
++      ['weight' => SORT_NUMERIC, 'name' => SORT_NATURAL | SORT_FLAG_CASE],
++      ['weight' => SORT_DESC]);
+     return array_replace(array_intersect_key($graph, $dependencies), $dependencies);
+   }
+ 
+@@ -189,13 +193,15 @@ public function sortAll() {
+     $graph = $this->getGraph();
+     // Sort by weight and alphabetically. The most dependent entities
+     // are last and entities with the same weight are alphabetically ordered.
+-    uasort($graph, array($this, 'sortGraphByWeight'));
++    $graph = StableSort::sortArraysByWeightKeys(
++      $graph,
++      ['weight' => SORT_NUMERIC, 'name' => SORT_NATURAL | SORT_FLAG_CASE]);
+     // Use array_intersect_key() to exclude modules and themes from the list.
+     return array_keys(array_intersect_key($graph, $this->data));
+   }
+ 
+   /**
+-   * Sorts the dependency graph by weight and alphabetically.
++   * Compares two nodes of the dependency graph by weight and by name.
+    *
+    * @param array $a
+    *   First item for comparison. The compared items should be associative
+@@ -216,7 +222,7 @@ protected function sortGraphByWeight(array $a, array $b) {
+   }
+ 
+   /**
+-   * Sorts the dependency graph by reverse weight and alphabetically.
++   * Compares two nodes of the dependency graph by reverse weight and by name.
+    *
+    * @param array $a
+    *   First item for comparison. The compared items should be associative
+diff --git a/core/lib/Drupal/Core/Config/Entity/ConfigEntityBase.php b/core/lib/Drupal/Core/Config/Entity/ConfigEntityBase.php
+index 08e7e19..5d342df 100644
+--- a/core/lib/Drupal/Core/Config/Entity/ConfigEntityBase.php
++++ b/core/lib/Drupal/Core/Config/Entity/ConfigEntityBase.php
+@@ -3,6 +3,7 @@
+ namespace Drupal\Core\Config\Entity;
+ 
+ use Drupal\Component\Utility\NestedArray;
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Cache\Cache;
+ use Drupal\Core\Config\Schema\SchemaIncompleteException;
+ use Drupal\Core\Entity\Entity;
+@@ -260,6 +261,25 @@ public static function sort(ConfigEntityInterface $a, ConfigEntityInterface $b)
+   }
+ 
+   /**
++   * @param \Drupal\Core\Config\Entity\ConfigEntityInterface[] $entities_unsorted
++   *   Unsorted list of config entities.
++   *
++   * @return \Drupal\Core\Config\Entity\ConfigEntityInterface[]
++   *   Sorted list of config entities.
++   */
++  public static function sortConfigEntities(array $entities_unsorted) {
++    $weights = [];
++    $labels = [];
++    foreach ($entities_unsorted as $config_entity) {
++      $weights[] = isset($config_entity->weight) ? $config_entity->weight : 0;
++      $labels[] = $config_entity->label();
++    }
++    return StableSort::sortByMultisortArgs(
++      $entities_unsorted,
++      [$weights, SORT_NUMERIC, $labels, SORT_NATURAL | SORT_FLAG_CASE]);
++  }
++
++  /**
+    * {@inheritdoc}
+    */
+   public function toArray() {
+diff --git a/core/lib/Drupal/Core/Config/Entity/ConfigEntityListBuilder.php b/core/lib/Drupal/Core/Config/Entity/ConfigEntityListBuilder.php
+index acd9d03..1b2dcb1 100644
+--- a/core/lib/Drupal/Core/Config/Entity/ConfigEntityListBuilder.php
++++ b/core/lib/Drupal/Core/Config/Entity/ConfigEntityListBuilder.php
+@@ -20,7 +20,7 @@ public function load() {
+     $entities = $this->storage->loadMultipleOverrideFree($entity_ids);
+ 
+     // Sort the entities using the entity class's sort() method.
+-    // See \Drupal\Core\Config\Entity\ConfigEntityBase::sort().
++    /* @see \Drupal\Core\Config\Entity\ConfigEntityBase::sort() */
+     uasort($entities, array($this->entityType->getClass(), 'sort'));
+     return $entities;
+   }
+diff --git a/core/lib/Drupal/Core/Config/Entity/Query/Query.php b/core/lib/Drupal/Core/Config/Entity/Query/Query.php
+index eee073f..471365d 100644
+--- a/core/lib/Drupal/Core/Config/Entity/Query/Query.php
++++ b/core/lib/Drupal/Core/Config/Entity/Query/Query.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\Core\Config\Entity\Query;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Config\ConfigFactoryInterface;
+ use Drupal\Core\Entity\EntityTypeInterface;
+ use Drupal\Core\Entity\Query\QueryBase;
+@@ -85,13 +86,16 @@ public function execute() {
+     $result = $this->condition->compile($configs);
+ 
+     // Apply sort settings.
+-    foreach ($this->sort as $sort) {
+-      $direction = $sort['direction'] == 'ASC' ? -1 : 1;
+-      $field = $sort['field'];
+-      uasort($result, function($a, $b) use ($field, $direction) {
+-        return ($a[$field] <= $b[$field]) ? $direction : -$direction;
+-      });
++    $sort_flags_by_weight_key = [];
++    $sort_directions = [];
++    foreach (array_reverse($this->sort) as $sort) {
++      if (isset($sort_flags_by_weight_key[$sort['field']])) {
++        continue;
++      }
++      $sort_flags_by_weight_key[$sort['field']] = SORT_REGULAR;
++      $sort_directions[$sort['field']] = ($sort['direction'] === 'ASC') ? SORT_ASC : SORT_DESC;
+     }
++    $result = StableSort::sortArraysByWeightKeys($result, $sort_flags_by_weight_key, $sort_directions);
+ 
+     // Let the pager do its work.
+     $this->initializePager();
+diff --git a/core/lib/Drupal/Core/Entity/EntityListBuilder.php b/core/lib/Drupal/Core/Entity/EntityListBuilder.php
+index b9c8db3..268f125 100644
+--- a/core/lib/Drupal/Core/Entity/EntityListBuilder.php
++++ b/core/lib/Drupal/Core/Entity/EntityListBuilder.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\Core\Entity;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Symfony\Component\DependencyInjection\ContainerInterface;
+ 
+ /**
+@@ -122,7 +123,7 @@ public function getOperations(EntityInterface $entity) {
+     $operations = $this->getDefaultOperations($entity);
+     $operations += $this->moduleHandler()->invokeAll('entity_operation', array($entity));
+     $this->moduleHandler->alter('entity_operation', $operations, $entity);
+-    uasort($operations, '\Drupal\Component\Utility\SortArray::sortByWeightElement');
++    $operations = StableSort::sortMixedByWeightKey($operations);
+ 
+     return $operations;
+   }
+diff --git a/core/lib/Drupal/Core/Entity/EntityReferenceSelection/SelectionPluginManager.php b/core/lib/Drupal/Core/Entity/EntityReferenceSelection/SelectionPluginManager.php
+index 1b35d4a..cf6a4dc 100644
+--- a/core/lib/Drupal/Core/Entity/EntityReferenceSelection/SelectionPluginManager.php
++++ b/core/lib/Drupal/Core/Entity/EntityReferenceSelection/SelectionPluginManager.php
+@@ -3,6 +3,7 @@
+ namespace Drupal\Core\Entity\EntityReferenceSelection;
+ 
+ use Drupal\Component\Plugin\FallbackPluginManagerInterface;
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Cache\CacheBackendInterface;
+ use Drupal\Core\Entity\EntityInterface;
+ use Drupal\Core\Field\FieldDefinitionInterface;
+@@ -59,12 +60,12 @@ public function getInstance(array $options) {
+    */
+   public function getPluginId($target_type, $base_plugin_id) {
+     // Get all available selection plugins for this entity type.
+-    $selection_handler_groups = $this->getSelectionGroups($target_type);
++    $selection_handler_group = $this->getSelectionGroups($target_type)[$base_plugin_id];
+ 
+     // Sort the selection plugins by weight and select the best match.
+-    uasort($selection_handler_groups[$base_plugin_id], array('Drupal\Component\Utility\SortArray', 'sortByWeightElement'));
+-    end($selection_handler_groups[$base_plugin_id]);
+-    $plugin_id = key($selection_handler_groups[$base_plugin_id]);
++    $selection_handler_group = StableSort::sortMixedByWeightKey($selection_handler_group);
++    end($selection_handler_group);
++    $plugin_id = key($selection_handler_group);
+ 
+     return $plugin_id;
+   }
+diff --git a/core/lib/Drupal/Core/Entity/KeyValueStore/Query/Query.php b/core/lib/Drupal/Core/Entity/KeyValueStore/Query/Query.php
+index 3f7a6a6..f0864d5 100644
+--- a/core/lib/Drupal/Core/Entity/KeyValueStore/Query/Query.php
++++ b/core/lib/Drupal/Core/Entity/KeyValueStore/Query/Query.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\Core\Entity\KeyValueStore\Query;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Entity\EntityTypeInterface;
+ use Drupal\Core\Entity\Query\QueryBase;
+ use Drupal\Core\KeyValueStore\KeyValueFactoryInterface;
+@@ -47,13 +48,16 @@ public function execute() {
+     $result = $this->condition->compile($records);
+ 
+     // Apply sort settings.
+-    foreach ($this->sort as $sort) {
+-      $direction = $sort['direction'] == 'ASC' ? -1 : 1;
+-      $field = $sort['field'];
+-      uasort($result, function($a, $b) use ($field, $direction) {
+-        return ($a[$field] <= $b[$field]) ? $direction : -$direction;
+-      });
++    $sort_flags_by_weight_key = [];
++    $sort_directions = [];
++    foreach (array_reverse($this->sort) as $sort) {
++      if (isset($sort_flags_by_weight_key[$sort['field']])) {
++        continue;
++      }
++      $sort_flags_by_weight_key[$sort['field']] = SORT_REGULAR;
++      $sort_directions[$sort['field']] = ($sort['direction'] === 'ASC') ? SORT_ASC : SORT_DESC;
+     }
++    $result = StableSort::sortArraysByWeightKeys($result, $sort_flags_by_weight_key, $sort_directions);
+ 
+     // Let the pager do its work.
+     $this->initializePager();
+diff --git a/core/lib/Drupal/Core/Entity/Query/QueryInterface.php b/core/lib/Drupal/Core/Entity/Query/QueryInterface.php
+index 17b266f..64701e0 100644
+--- a/core/lib/Drupal/Core/Entity/Query/QueryInterface.php
++++ b/core/lib/Drupal/Core/Entity/Query/QueryInterface.php
+@@ -142,6 +142,10 @@ public function pager($limit = 10, $element = NULL);
+   public function range($start = NULL, $length = NULL);
+ 
+   /**
++   * Adds a sort criterion to the query.
++   *
++   * The latest added sort criterion is always the "strongest".
++   *
+    * @param $field
+    *   Name of a field.
+    * @param string $direction
+diff --git a/core/lib/Drupal/Core/Extension/Extension.php b/core/lib/Drupal/Core/Extension/Extension.php
+index 0238714..066fd7c 100644
+--- a/core/lib/Drupal/Core/Extension/Extension.php
++++ b/core/lib/Drupal/Core/Extension/Extension.php
+@@ -2,6 +2,8 @@
+ 
+ namespace Drupal\Core\Extension;
+ 
++use Drupal\Component\Utility\StableSort;
++
+ /**
+  * Defines an extension (file) object.
+  */
+@@ -199,4 +201,17 @@ public function unserialize($data) {
+     }
+   }
+ 
++  /**
++   * @param \Drupal\Core\Extension\Extension[] $extensions_unsorted
++   *
++   * @return \Drupal\Core\Extension\Extension[]
++   */
++  public static function sortExtensionsByInfoName(array $extensions_unsorted) {
++    $names = [];
++    foreach ($extensions_unsorted as $k => $extension) {
++      $names[] = $extension->info['name'];
++    }
++    return StableSort::sortByWeights($extensions_unsorted, $names, SORT_STRING | SORT_FLAG_CASE);
++  }
++
+ }
+diff --git a/core/lib/Drupal/Core/Extension/ThemeHandler.php b/core/lib/Drupal/Core/Extension/ThemeHandler.php
+index 8c573bb..30c351d 100644
+--- a/core/lib/Drupal/Core/Extension/ThemeHandler.php
++++ b/core/lib/Drupal/Core/Extension/ThemeHandler.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\Core\Extension;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Config\ConfigFactoryInterface;
+ use Drupal\Core\State\StateInterface;
+ 
+@@ -496,4 +497,42 @@ public function hasUi($name) {
+     return FALSE;
+   }
+ 
++  /**
++   * Sorts themes by (human) name, with the default theme first.
++   *
++   * @param \Drupal\Core\Extension\Extension[] $themes_unsorted
++   *   Array of themes to be sorted.
++   *
++   * @return \Drupal\Core\Extension\Extension[]
++   *   Sorted array of themes.
++   */
++  public static function sortThemes(array $themes_unsorted) {
++
++    // Isolate the default theme(s) from the list.
++    // Generally there is only one "default" theme. But this component does not
++    // rely on external knowledge, so it assumes there can be more than one.
++    $themes_unsorted_default = [];
++    foreach ($themes_unsorted as $k => $theme) {
++      if (!empty($theme->is_default)) {
++        $themes_unsorted_default[$k] = $theme;
++        unset($themes_unsorted[$k]);
++      }
++    }
++
++    // Sort remaining themes by $theme->info['name'].
++    $themes_other_sorted = Extension::sortExtensionsByInfoName($themes_unsorted);
++
++    if (count($themes_unsorted_default) === 1) {
++      // Prepend the default theme at the beginning.
++      return $themes_unsorted_default + $themes_other_sorted;
++    }
++
++    if ($themes_unsorted_default === []) {
++      return $themes_other_sorted;
++    }
++
++    // Prepend the default theme at the beginning.
++    return Extension::sortExtensionsByInfoName($themes_unsorted_default) + $themes_other_sorted;
++  }
++
+ }
+diff --git a/core/lib/Drupal/Core/Field/FormatterPluginManager.php b/core/lib/Drupal/Core/Field/FormatterPluginManager.php
+index ca9bd06..7acbeb3 100644
+--- a/core/lib/Drupal/Core/Field/FormatterPluginManager.php
++++ b/core/lib/Drupal/Core/Field/FormatterPluginManager.php
+@@ -3,6 +3,7 @@
+ namespace Drupal\Core\Field;
+ 
+ use Drupal\Component\Plugin\Factory\DefaultFactory;
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Cache\CacheBackendInterface;
+ use Drupal\Core\Extension\ModuleHandlerInterface;
+ use Drupal\Core\Plugin\DefaultPluginManager;
+@@ -171,7 +172,7 @@ public function getOptions($field_type = NULL) {
+       $options = array();
+       $field_types = $this->fieldTypeManager->getDefinitions();
+       $formatter_types = $this->getDefinitions();
+-      uasort($formatter_types, array('Drupal\Component\Utility\SortArray', 'sortByWeightElement'));
++      $formatter_types = StableSort::sortMixedByWeightKey($formatter_types);
+       foreach ($formatter_types as $name => $formatter_type) {
+         foreach ($formatter_type['field_types'] as $formatter_field_type) {
+           // Check that the field type exists.
+diff --git a/core/lib/Drupal/Core/Field/WidgetPluginManager.php b/core/lib/Drupal/Core/Field/WidgetPluginManager.php
+index 6be1b9e..3534a31 100644
+--- a/core/lib/Drupal/Core/Field/WidgetPluginManager.php
++++ b/core/lib/Drupal/Core/Field/WidgetPluginManager.php
+@@ -3,6 +3,7 @@
+ namespace Drupal\Core\Field;
+ 
+ use Drupal\Component\Plugin\Factory\DefaultFactory;
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Cache\CacheBackendInterface;
+ use Drupal\Core\Extension\ModuleHandlerInterface;
+ use Drupal\Core\Plugin\DefaultPluginManager;
+@@ -171,7 +172,7 @@ public function getOptions($field_type = NULL) {
+       $options = array();
+       $field_types = $this->fieldTypeManager->getDefinitions();
+       $widget_types = $this->getDefinitions();
+-      uasort($widget_types, array('Drupal\Component\Utility\SortArray', 'sortByWeightElement'));
++      $widget_types = StableSort::sortMixedByWeightKey($widget_types);
+       foreach ($widget_types as $name => $widget_type) {
+         foreach ($widget_type['field_types'] as $widget_field_type) {
+           // Check that the field type exists.
+diff --git a/core/lib/Drupal/Core/Language/Language.php b/core/lib/Drupal/Core/Language/Language.php
+index abaad81..dccc495 100644
+--- a/core/lib/Drupal/Core/Language/Language.php
++++ b/core/lib/Drupal/Core/Language/Language.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\Core\Language;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\StringTranslation\TranslatableMarkup;
+ 
+ /**
+@@ -144,24 +145,23 @@ public function isLocked() {
+    *   The array of language objects keyed by langcode.
+    */
+   public static function sort(&$languages) {
+-    uasort($languages, function (LanguageInterface $a, LanguageInterface $b) {
+-      $a_weight = $a->getWeight();
+-      $b_weight = $b->getWeight();
+-      if ($a_weight == $b_weight) {
+-        $a_name = $a->getName();
+-        $b_name = $b->getName();
+-        // If either name is a TranslatableMarkup object it can not be converted
+-        // to a string. This is because translation requires a sorted list of
+-        // languages thereby causing an infinite loop. Determine the order based
+-        // on ID if this is the case.
+-        if ($a_name instanceof TranslatableMarkup || $b_name instanceof TranslatableMarkup) {
+-          $a_name = $a->getId();
+-          $b_name = $b->getId();
+-        }
+-        return strnatcasecmp($a_name, $b_name);
++    $weights = [];
++    $names = [];
++    foreach ($languages as $k => $language) {
++      $weights[] = $language->getWeight();
++      $name = $language->getName();
++      // If the name is a TranslatableMarkup object, it can not be converted to
++      // a string. This is because translation requires a sorted list of
++      // languages thereby causing an infinite loop. Determine the order based
++      // on ID if this is the case.
++      if ($name instanceof TranslatableMarkup) {
++        $name = $language->getId();
+       }
+-      return ($a_weight < $b_weight) ? -1 : 1;
+-    });
++      $names[] = $name;
++    }
++    $languages = StableSort::sortByMultisortArgs(
++      $languages,
++      [$weights, SORT_NUMERIC, $names, SORT_NATURAL | SORT_FLAG_CASE]);
+   }
+ 
+   /**
+diff --git a/core/lib/Drupal/Core/Plugin/CategorizingPluginManagerTrait.php b/core/lib/Drupal/Core/Plugin/CategorizingPluginManagerTrait.php
+index 1426562..e4df527 100644
+--- a/core/lib/Drupal/Core/Plugin/CategorizingPluginManagerTrait.php
++++ b/core/lib/Drupal/Core/Plugin/CategorizingPluginManagerTrait.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\Core\Plugin;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\StringTranslation\StringTranslationTrait;
+ 
+ /**
+@@ -90,13 +91,13 @@ public function getSortedDefinitions(array $definitions = NULL, $label_key = 'la
+     // Sort the plugins first by category, then by label.
+     /** @var \Drupal\Core\Plugin\CategorizingPluginManagerTrait|\Drupal\Component\Plugin\PluginManagerInterface $this */
+     $definitions = isset($definitions) ? $definitions : $this->getDefinitions();
+-    uasort($definitions, function ($a, $b) use ($label_key) {
+-      if ($a['category'] != $b['category']) {
+-        return strnatcasecmp($a['category'], $b['category']);
+-      }
+-      return strnatcasecmp($a[$label_key], $b[$label_key]);
+-    });
+-    return $definitions;
++
++    return StableSort::sortArraysByWeightKeys(
++      $definitions,
++      [
++        'category' => SORT_NATURAL | SORT_FLAG_CASE,
++        $label_key => SORT_NATURAL | SORT_FLAG_CASE,
++      ]);
+   }
+ 
+   /**
+diff --git a/core/lib/Drupal/Core/Plugin/DefaultLazyPluginCollection.php b/core/lib/Drupal/Core/Plugin/DefaultLazyPluginCollection.php
+index 1928bfb..2dcd6d6 100644
+--- a/core/lib/Drupal/Core/Plugin/DefaultLazyPluginCollection.php
++++ b/core/lib/Drupal/Core/Plugin/DefaultLazyPluginCollection.php
+@@ -6,6 +6,7 @@
+ use Drupal\Component\Plugin\LazyPluginCollection;
+ use Drupal\Component\Plugin\PluginManagerInterface;
+ use Drupal\Component\Plugin\ConfigurablePluginInterface;
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\DependencyInjection\DependencySerializationTrait;
+ 
+ /**
+@@ -87,17 +88,21 @@ protected function initializePlugin($instance_id) {
+    * @return $this
+    */
+   public function sort() {
+-    uasort($this->instanceIDs, array($this, 'sortHelper'));
++    $this->instanceIDs = $this->sortInstanceIds($this->instanceIDs);
+     return $this;
+   }
+ 
+   /**
+-   * Provides uasort() callback to sort plugins.
++   * @param string[] $instance_ids
++   *
++   * @return string[]
+    */
+-  public function sortHelper($aID, $bID) {
+-    $a = $this->get($aID);
+-    $b = $this->get($bID);
+-    return strnatcasecmp($a->getPluginId(), $b->getPluginId());
++  public function sortInstanceIds(array $instance_ids) {
++    $plugin_ids = [];
++    foreach ($instance_ids as $instance_id) {
++      $plugin_ids[] = $this->get($instance_id)->getPluginId();
++    }
++    return StableSort::sortByWeights($instance_ids, $plugin_ids, SORT_NATURAL | SORT_FLAG_CASE);
+   }
+ 
+   /**
+diff --git a/core/modules/block/src/BlockRepository.php b/core/modules/block/src/BlockRepository.php
+index 53620a0..bfc5f01 100644
+--- a/core/modules/block/src/BlockRepository.php
++++ b/core/modules/block/src/BlockRepository.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\block;
+ 
++use Drupal\block\Entity\Block;
+ use Drupal\Core\Cache\CacheableMetadata;
+ use Drupal\Core\Entity\EntityManagerInterface;
+ use Drupal\Core\Plugin\Context\ContextHandlerInterface;
+@@ -71,9 +72,7 @@ public function getVisibleBlocksPerRegion(array &$cacheable_metadata = []) {
+     // Merge it with the actual values to maintain the region ordering.
+     $assignments = array_intersect_key(array_merge($empty, $full), $empty);
+     foreach ($assignments as &$assignment) {
+-      // Suppress errors because PHPUnit will indirectly modify the contents,
+-      // triggering https://bugs.php.net/bug.php?id=50688.
+-      @uasort($assignment, 'Drupal\block\Entity\Block::sort');
++      $assignment = Block::sortBlocks($assignment);
+     }
+     return $assignments;
+   }
+diff --git a/core/modules/block/src/Entity/Block.php b/core/modules/block/src/Entity/Block.php
+index 9cbd30b..5ab7d9d 100644
+--- a/core/modules/block/src/Entity/Block.php
++++ b/core/modules/block/src/Entity/Block.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\block\Entity;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Cache\Cache;
+ use Drupal\Core\Condition\ConditionPluginCollection;
+ use Drupal\Core\Config\Entity\ConfigEntityBase;
+@@ -202,6 +203,11 @@ public function label() {
+ 
+   /**
+    * Sorts active blocks by weight; sorts inactive blocks by name.
++   *
++   * @param \Drupal\Core\Config\Entity\ConfigEntityInterface|\Drupal\block\BlockInterface $a
++   * @param \Drupal\Core\Config\Entity\ConfigEntityInterface|\Drupal\block\BlockInterface $b
++   *
++   * @return int
+    */
+   public static function sort(ConfigEntityInterface $a, ConfigEntityInterface $b) {
+     // Separate enabled from disabled.
+@@ -221,6 +227,35 @@ public static function sort(ConfigEntityInterface $a, ConfigEntityInterface $b)
+   }
+ 
+   /**
++   * Sorts an array of blocks.
++   *
++   * @param \Drupal\block\BlockInterface[] $blocks_unsorted
++   *   Unsorted list of blocks.
++   *
++   * @return \Drupal\block\BlockInterface[]
++   *   Sorted list of blocks.
++   */
++  public static function sortBlocks(array $blocks_unsorted) {
++    // Arrays with less than two elements do not need sorting.
++    if (count($blocks_unsorted) < 2) {
++      return $blocks_unsorted;
++    }
++    $statuses = [];
++    $weights = [];
++    $labels = [];
++    foreach ($blocks_unsorted as $block) {
++      $statuses[] = (int)$block->status();
++      $weights[] = ($block->getRegion() != static::BLOCK_REGION_NONE)
++        ? $block->getWeight()
++        : 0;
++      $labels[] = $block->label();
++    }
++    return StableSort::sortByMultisortArgs(
++      $blocks_unsorted,
++      [$statuses, SORT_NUMERIC, $weights, SORT_NUMERIC, $labels, SORT_STRING]);
++  }
++
++  /**
+    * {@inheritdoc}
+    */
+   public function calculateDependencies() {
+diff --git a/core/modules/breakpoint/src/BreakpointManager.php b/core/modules/breakpoint/src/BreakpointManager.php
+index 693ffa9..3f04add 100644
+--- a/core/modules/breakpoint/src/BreakpointManager.php
++++ b/core/modules/breakpoint/src/BreakpointManager.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\breakpoint;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Cache\Cache;
+ use Drupal\Core\Cache\CacheBackendInterface;
+ use Drupal\Core\Extension\ModuleHandlerInterface;
+@@ -159,7 +160,7 @@ public function getBreakpointsByGroup($group) {
+             $breakpoints[$plugin_id] = $plugin_definition;
+           }
+         }
+-        uasort($breakpoints, array('Drupal\Component\Utility\SortArray', 'sortByWeightElement'));
++        $breakpoints = StableSort::sortArraysByWeightKey($breakpoints);
+         $this->cacheBackend->set($this->cacheKey . ':' . $group, $breakpoints, Cache::PERMANENT, array('breakpoints'));
+         $this->breakpointsByGroup[$group] = $breakpoints;
+       }
+diff --git a/core/modules/config/src/Form/ConfigSingleExportForm.php b/core/modules/config/src/Form/ConfigSingleExportForm.php
+index b6bc0e7..f2c373a 100644
+--- a/core/modules/config/src/Form/ConfigSingleExportForm.php
++++ b/core/modules/config/src/Form/ConfigSingleExportForm.php
+@@ -81,7 +81,7 @@ public function buildForm(array $form, FormStateInterface $form_state, $config_t
+       return $definition->getLabel();
+     }, $this->definitions);
+     // Sort the entity types by label, then add the simple config to the top.
+-    uasort($entity_types, 'strnatcasecmp');
++    asort($entity_types, SORT_NATURAL | SORT_FLAG_CASE);
+     $config_types = array(
+       'system.simple' => $this->t('Simple configuration'),
+     ) + $entity_types;
+diff --git a/core/modules/config/src/Form/ConfigSingleImportForm.php b/core/modules/config/src/Form/ConfigSingleImportForm.php
+index 09bc6f2..7a1a560 100644
+--- a/core/modules/config/src/Form/ConfigSingleImportForm.php
++++ b/core/modules/config/src/Form/ConfigSingleImportForm.php
+@@ -226,7 +226,7 @@ public function buildForm(array $form, FormStateInterface $form_state) {
+       }
+     }
+     // Sort the entity types by label, then add the simple config to the top.
+-    uasort($entity_types, 'strnatcasecmp');
++    asort($entity_types, SORT_NATURAL | SORT_FLAG_CASE);
+     $config_types = array(
+       'system.simple' => $this->t('Simple configuration'),
+     ) + $entity_types;
+diff --git a/core/modules/config/src/Tests/ConfigEntityListTest.php b/core/modules/config/src/Tests/ConfigEntityListTest.php
+index 9d31de0..0ec72ea 100644
+--- a/core/modules/config/src/Tests/ConfigEntityListTest.php
++++ b/core/modules/config/src/Tests/ConfigEntityListTest.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\config\Tests;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\simpletest\WebTestBase;
+ use Drupal\config_test\Entity\ConfigTest;
+ use Drupal\Core\Entity\EntityStorageInterface;
+@@ -70,7 +71,7 @@ function testList() {
+ 
+     $actual_operations = $controller->getOperations($entity);
+     // Sort the operations to normalize link order.
+-    uasort($actual_operations, array('Drupal\Component\Utility\SortArray', 'sortByWeightElement'));
++    $actual_operations = StableSort::sortMixedByWeightKey($actual_operations);
+     $this->assertEqual($expected_operations, $actual_operations, 'The operations are identical.');
+ 
+     // Test buildHeader() method.
+@@ -140,7 +141,7 @@ function testList() {
+ 
+     $actual_operations = $controller->getOperations($entity);
+     // Sort the operations to normalize link order.
+-    uasort($actual_operations, array('Drupal\Component\Utility\SortArray', 'sortByWeightElement'));
++    $actual_operations = StableSort::sortMixedByWeightKey($actual_operations);
+     $this->assertEqual($expected_operations, $actual_operations, 'The operations are identical.');
+   }
+ 
+diff --git a/core/modules/config_translation/src/Controller/ConfigTranslationMapperList.php b/core/modules/config_translation/src/Controller/ConfigTranslationMapperList.php
+index f47d313..24b80a2 100644
+--- a/core/modules/config_translation/src/Controller/ConfigTranslationMapperList.php
++++ b/core/modules/config_translation/src/Controller/ConfigTranslationMapperList.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\config_translation\Controller;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\config_translation\ConfigMapperInterface;
+ use Drupal\Core\Controller\ControllerBase;
+ use Symfony\Component\DependencyInjection\ContainerInterface;
+@@ -119,7 +120,7 @@ public function buildHeader() {
+   protected function buildOperations(ConfigMapperInterface $mapper) {
+     // Retrieve and sort operations.
+     $operations = $mapper->getOperations();
+-    uasort($operations, 'Drupal\Component\Utility\SortArray::sortByWeightElement');
++    $operations = StableSort::sortMixedByWeightKey($operations);
+     $build = array(
+       '#type' => 'operations',
+       '#links' => $operations,
+diff --git a/core/modules/field_ui/src/Element/FieldUiTable.php b/core/modules/field_ui/src/Element/FieldUiTable.php
+index 05d5d04..48558d0 100644
+--- a/core/modules/field_ui/src/Element/FieldUiTable.php
++++ b/core/modules/field_ui/src/Element/FieldUiTable.php
+@@ -3,6 +3,7 @@
+ namespace Drupal\field_ui\Element;
+ 
+ use Drupal\Component\Utility\Html;
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Render\Element;
+ use Drupal\Core\Render\Element\Table;
+ 
+@@ -229,7 +230,7 @@ public static function reduceOrder($array, $a) {
+       $array[] = $a['name'];
+     }
+     if (!empty($a['children'])) {
+-      uasort($a['children'], ['Drupal\Component\Utility\SortArray', 'sortByWeightElement']);
++      $a['children'] = StableSort::sortMixedByWeightKey($a['children']);
+       $array = array_merge($array, array_reduce($a['children'], [static::class, 'reduceOrder']));
+     }
+ 
+diff --git a/core/modules/field_ui/src/FieldConfigListBuilder.php b/core/modules/field_ui/src/FieldConfigListBuilder.php
+index c8739da..d519933 100644
+--- a/core/modules/field_ui/src/FieldConfigListBuilder.php
++++ b/core/modules/field_ui/src/FieldConfigListBuilder.php
+@@ -92,7 +92,7 @@ public function load() {
+     });
+ 
+     // Sort the entities using the entity class's sort() method.
+-    // See \Drupal\Core\Config\Entity\ConfigEntityBase::sort().
++    /* @see \Drupal\Core\Config\Entity\ConfigEntityBase::sort() */
+     uasort($entities, array($this->entityType->getClass(), 'sort'));
+     return $entities;
+   }
+diff --git a/core/modules/filter/filter.module b/core/modules/filter/filter.module
+index f52614a..a264ddb 100644
+--- a/core/modules/filter/filter.module
++++ b/core/modules/filter/filter.module
+@@ -8,6 +8,7 @@
+ use Drupal\Component\Utility\Html;
+ use Drupal\Component\Utility\Unicode;
+ use Drupal\Core\Cache\Cache;
++use Drupal\Core\Config\Entity\ConfigEntityBase;
+ use Drupal\Core\Routing\RouteMatchInterface;
+ use Drupal\Core\Session\AccountInterface;
+ use Drupal\Core\Template\Attribute;
+@@ -103,7 +104,7 @@ function filter_formats(AccountInterface $account = NULL) {
+     }
+     else {
+       $formats['all'] = \Drupal::entityManager()->getStorage('filter_format')->loadByProperties(array('status' => TRUE));
+-      uasort($formats['all'], 'Drupal\Core\Config\Entity\ConfigEntityBase::sort');
++      $formats['all'] = ConfigEntityBase::sortConfigEntities($formats['all']);
+       \Drupal::cache()->set("filter_formats:{$language_interface->getId()}", $formats['all'], Cache::PERMANENT, \Drupal::entityManager()->getDefinition('filter_format')->getListCacheTags());
+     }
+   }
+diff --git a/core/modules/filter/src/FilterPermissions.php b/core/modules/filter/src/FilterPermissions.php
+index fc22f3c..d77cb04 100644
+--- a/core/modules/filter/src/FilterPermissions.php
++++ b/core/modules/filter/src/FilterPermissions.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\filter;
+ 
++use Drupal\Core\Config\Entity\ConfigEntityBase;
+ use Drupal\Core\DependencyInjection\ContainerInjectionInterface;
+ use Drupal\Core\Entity\EntityManagerInterface;
+ use Drupal\Core\StringTranslation\StringTranslationTrait;
+@@ -49,7 +50,7 @@ public function permissions() {
+     // of them are potentially unsafe.
+     /** @var \Drupal\filter\FilterFormatInterface[] $formats */
+     $formats = $this->entityManager->getStorage('filter_format')->loadByProperties(['status' => TRUE]);
+-    uasort($formats, 'Drupal\Core\Config\Entity\ConfigEntityBase::sort');
++    $formats = ConfigEntityBase::sortConfigEntities($formats);
+     foreach ($formats as $format) {
+       if ($permission = $format->getPermissionName()) {
+         $permissions[$permission] = [
+diff --git a/core/modules/filter/src/FilterPluginCollection.php b/core/modules/filter/src/FilterPluginCollection.php
+index fc6ec06..d663c8e 100644
+--- a/core/modules/filter/src/FilterPluginCollection.php
++++ b/core/modules/filter/src/FilterPluginCollection.php
+@@ -3,6 +3,7 @@
+ namespace Drupal\filter;
+ 
+ use Drupal\Component\Utility\NestedArray;
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Plugin\DefaultLazyPluginCollection;
+ 
+ /**
+@@ -87,19 +88,20 @@ public function sort() {
+   /**
+    * {@inheritdoc}
+    */
+-  public function sortHelper($aID, $bID) {
+-    $a = $this->get($aID);
+-    $b = $this->get($bID);
+-    if ($a->status != $b->status) {
+-      return !empty($a->status) ? -1 : 1;
++  public function sortInstanceIds(array $instance_ids) {
++    $statuses = [];
++    $weights = [];
++    $providers = [];
++    foreach ($instance_ids as $instance_id) {
++      $plugin = $this->get($instance_id);
++      $statuses[] = empty($plugin->status) ? 0 : 1;
++      $weights[] = $plugin->weight;
++      $providers[] = $plugin->provider;
+     }
+-    if ($a->weight != $b->weight) {
+-      return $a->weight < $b->weight ? -1 : 1;
+-    }
+-    if ($a->provider != $b->provider) {
+-      return strnatcasecmp($a->provider, $b->provider);
+-    }
+-    return parent::sortHelper($aID, $bID);
++
++    return StableSort::sortByMultisortArgs(
++      $instance_ids,
++      [$statuses, SORT_NUMERIC, $weights, SORT_REGULAR, $providers, SORT_REGULAR]);
+   }
+ 
+   /**
+diff --git a/core/modules/image/src/Form/ImageStyleEditForm.php b/core/modules/image/src/Form/ImageStyleEditForm.php
+index ecfcf6f..e0057e4 100644
+--- a/core/modules/image/src/Form/ImageStyleEditForm.php
++++ b/core/modules/image/src/Form/ImageStyleEditForm.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\image\Form;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Entity\EntityStorageInterface;
+ use Drupal\Core\Form\FormStateInterface;
+ use Drupal\Core\Url;
+@@ -142,9 +143,7 @@ public function form(array $form, FormStateInterface $form_state) {
+     // Build the new image effect addition form and add it to the effect list.
+     $new_effect_options = array();
+     $effects = $this->imageEffectManager->getDefinitions();
+-    uasort($effects, function ($a, $b) {
+-      return strcasecmp($a['id'], $b['id']);
+-    });
++    $effects = StableSort::sortArraysByWeightKey($effects, 'id', SORT_STRING | SORT_FLAG_CASE);
+     foreach ($effects as $effect => $definition) {
+       $new_effect_options[$effect] = $definition['label'];
+     }
+diff --git a/core/modules/image/src/ImageEffectPluginCollection.php b/core/modules/image/src/ImageEffectPluginCollection.php
+index 25ee6f2..292545e 100644
+--- a/core/modules/image/src/ImageEffectPluginCollection.php
++++ b/core/modules/image/src/ImageEffectPluginCollection.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\image;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Plugin\DefaultLazyPluginCollection;
+ 
+ /**
+@@ -21,14 +22,13 @@ public function &get($instance_id) {
+   /**
+    * {@inheritdoc}
+    */
+-  public function sortHelper($aID, $bID) {
+-    $a_weight = $this->get($aID)->getWeight();
+-    $b_weight = $this->get($bID)->getWeight();
+-    if ($a_weight == $b_weight) {
+-      return 0;
++  public function sortInstanceIds(array $instance_ids) {
++    $weights = [];
++    foreach ($instance_ids as $instance_id) {
++      $weights[] = $this->get($instance_id)->getWeight();
+     }
+-
+-    return ($a_weight < $b_weight) ? -1 : 1;
++    // @todo Probably SORT_NUMERIC would work better here?
++    return StableSort::sortByWeights($instance_ids, $weights, SORT_REGULAR);
+   }
+ 
+ }
+diff --git a/core/modules/language/src/HttpKernel/PathProcessorLanguage.php b/core/modules/language/src/HttpKernel/PathProcessorLanguage.php
+index 2e91305..10b0be2 100644
+--- a/core/modules/language/src/HttpKernel/PathProcessorLanguage.php
++++ b/core/modules/language/src/HttpKernel/PathProcessorLanguage.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\language\HttpKernel;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Component\Utility\Unicode;
+ use Drupal\Core\Config\ConfigFactoryInterface;
+ use Drupal\Core\PathProcessor\InboundPathProcessorInterface;
+@@ -131,32 +132,21 @@ public function processOutbound($path, &$options = array(), Request $request = N
+    */
+   protected function initProcessors($scope) {
+     $interface = '\Drupal\Core\PathProcessor\\' . Unicode::ucfirst($scope) . 'PathProcessorInterface';
+-    $this->processors[$scope] = array();
++    $processors = array();
+     $weights = [];
+     foreach ($this->languageManager->getLanguageTypes() as $type) {
+       foreach ($this->negotiator->getNegotiationMethods($type) as $method_id => $method) {
+-        if (!isset($this->processors[$scope][$method_id])) {
++        if (!isset($processors[$method_id])) {
+           $reflector = new \ReflectionClass($method['class']);
+           if ($reflector->implementsInterface($interface)) {
+-            $this->processors[$scope][$method_id] = $this->negotiator->getNegotiationMethodInstance($method_id);
++            $processors[$method_id] = $this->negotiator->getNegotiationMethodInstance($method_id);
+             $weights[$method_id] = $method['weight'];
+           }
+         }
+       }
+     }
+ 
+-    // Sort the processors list, so that their functions are called in the
+-    // order specified by the weight of the methods.
+-    uksort($this->processors[$scope], function ($method_id_a, $method_id_b) use($weights) {
+-      $a_weight = $weights[$method_id_a];
+-      $b_weight = $weights[$method_id_b];
+-
+-      if ($a_weight == $b_weight) {
+-        return 0;
+-      }
+-
+-      return ($a_weight < $b_weight) ? -1 : 1;
+-    });
++    $this->processors[$scope] = StableSort::sortByWeights($processors, $weights, SORT_REGULAR);
+   }
+ 
+   /**
+diff --git a/core/modules/language/src/LanguageListBuilder.php b/core/modules/language/src/LanguageListBuilder.php
+index 5d69f1f..8142684 100644
+--- a/core/modules/language/src/LanguageListBuilder.php
++++ b/core/modules/language/src/LanguageListBuilder.php
+@@ -74,7 +74,7 @@ public function load() {
+     $entities = $this->storage->loadByProperties(array('locked' => FALSE));
+ 
+     // Sort the entities using the entity class's sort() method.
+-    // See \Drupal\Core\Config\Entity\ConfigEntityBase::sort().
++    /* @see \Drupal\Core\Config\Entity\ConfigEntityBase::sort() */
+     uasort($entities, array($this->entityType->getClass(), 'sort'));
+     return $entities;
+   }
+diff --git a/core/modules/locale/src/Form/TranslationStatusForm.php b/core/modules/locale/src/Form/TranslationStatusForm.php
+index 31f8bb9..ef082ff 100644
+--- a/core/modules/locale/src/Form/TranslationStatusForm.php
++++ b/core/modules/locale/src/Form/TranslationStatusForm.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\locale\Form;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Extension\ModuleHandlerInterface;
+ use Drupal\Core\Form\FormBase;
+ use Drupal\Core\Form\FormStateInterface;
+@@ -74,6 +75,8 @@ public function buildForm(array $form, FormStateInterface $form_state) {
+     if ($languages && $status) {
+       $updates = $this->prepareUpdateData($status);
+ 
++      // Collect titles for options sorting.
++      $titles = [];
+       // Build data options for the select table.
+       foreach ($updates as $langcode => $update) {
+         $title = $languages[$langcode]->getName();
+@@ -86,7 +89,7 @@ public function buildForm(array $form, FormStateInterface $form_state) {
+         $options[$langcode] = array(
+           'title' => array(
+             'data' => array(
+-              '#title' => $title,
++              '#title' => $titles[] = $title,
+               '#plain_text' => $title,
+             ),
+           ),
+@@ -103,9 +106,7 @@ public function buildForm(array $form, FormStateInterface $form_state) {
+         }
+       }
+       // Sort the table data on language name.
+-      uasort($options, function ($a, $b) {
+-        return strcasecmp($a['title']['data']['#title'], $b['title']['data']['#title']);
+-      });
++      $options = StableSort::sortByWeights($options, $titles, SORT_STRING | SORT_FLAG_CASE);
+       $languages_not_found = array_diff($languages_not_found, $languages_update);
+     }
+ 
+diff --git a/core/modules/search/src/SearchPageRepository.php b/core/modules/search/src/SearchPageRepository.php
+index 459ea57..1949ca2 100644
+--- a/core/modules/search/src/SearchPageRepository.php
++++ b/core/modules/search/src/SearchPageRepository.php
+@@ -104,7 +104,9 @@ public function setDefaultSearchPage(SearchPageInterface $search_page) {
+    * {@inheritdoc}
+    */
+   public function sortSearchPages($search_pages) {
++    /* @var \Drupal\Core\Entity\EntityTypeInterface $entity_type */
+     $entity_type = $this->storage->getEntityType();
++    /* @see ?? */
+     uasort($search_pages, array($entity_type->getClass(), 'sort'));
+     return $search_pages;
+   }
+diff --git a/core/modules/shortcut/src/Entity/Shortcut.php b/core/modules/shortcut/src/Entity/Shortcut.php
+index 6ddaf05..5b5cf86 100644
+--- a/core/modules/shortcut/src/Entity/Shortcut.php
++++ b/core/modules/shortcut/src/Entity/Shortcut.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\shortcut\Entity;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Cache\Cache;
+ use Drupal\Core\Entity\ContentEntityBase;
+ use Drupal\Core\Entity\EntityStorageInterface;
+@@ -181,4 +182,21 @@ public static function sort(ShortcutInterface $a, ShortcutInterface $b) {
+     return ($a_weight < $b_weight) ? -1 : 1;
+   }
+ 
++  /**
++   * @param \Drupal\shortcut\ShortcutInterface[] $shortcuts
++   *
++   * @return \Drupal\shortcut\ShortcutInterface[]
++   */
++  public static function sortShortcuts(array $shortcuts) {
++    $weights = [];
++    $titles = [];
++    foreach ($shortcuts as $shortcut) {
++      $weights[] = $shortcut->getWeight();
++      $titles[] = $shortcut->getTitle();
++    }
++    return StableSort::sortByMultisortArgs(
++      $shortcuts,
++      [$weights, SORT_NUMERIC, $titles, SORT_NATURAL | SORT_FLAG_CASE]);
++  }
++
+ }
+diff --git a/core/modules/shortcut/src/Entity/ShortcutSet.php b/core/modules/shortcut/src/Entity/ShortcutSet.php
+index 7b42310..ea26b35 100644
+--- a/core/modules/shortcut/src/Entity/ShortcutSet.php
++++ b/core/modules/shortcut/src/Entity/ShortcutSet.php
+@@ -117,7 +117,7 @@ public function resetLinkWeights() {
+    */
+   public function getShortcuts() {
+     $shortcuts = \Drupal::entityManager()->getStorage('shortcut')->loadByProperties(array('shortcut_set' => $this->id()));
+-    uasort($shortcuts, array('\Drupal\shortcut\Entity\Shortcut', 'sort'));
++    $shortcuts = Shortcut::sortShortcuts($shortcuts);
+     return $shortcuts;
+   }
+ 
+diff --git a/core/modules/simpletest/src/TestDiscovery.php b/core/modules/simpletest/src/TestDiscovery.php
+index d3a72dd..9f29a05 100644
+--- a/core/modules/simpletest/src/TestDiscovery.php
++++ b/core/modules/simpletest/src/TestDiscovery.php
+@@ -200,9 +200,9 @@ public function getTestClasses($extension = NULL, array $types = []) {
+     }
+ 
+     // Sort the groups and tests within the groups by name.
+-    uksort($list, 'strnatcasecmp');
++    ksort($list, SORT_NATURAL | SORT_FLAG_CASE);
+     foreach ($list as &$tests) {
+-      uksort($tests, 'strnatcasecmp');
++      ksort($tests, SORT_NATURAL | SORT_FLAG_CASE);
+     }
+ 
+     // Allow modules extending core tests to disable originals.
+diff --git a/core/modules/system/src/Controller/AdminController.php b/core/modules/system/src/Controller/AdminController.php
+index 57c13f6..91cdb9e 100644
+--- a/core/modules/system/src/Controller/AdminController.php
++++ b/core/modules/system/src/Controller/AdminController.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\system\Controller;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Controller\ControllerBase;
+ 
+ /**
+@@ -17,19 +18,14 @@ class AdminController extends ControllerBase {
+    */
+   public function index() {
+     $module_info = system_get_info('module');
+-    foreach ($module_info as $module => $info) {
+-      $module_info[$module] = new \stdClass();
+-      $module_info[$module]->info = $info;
+-    }
++    $module_info = StableSort::sortArraysByWeightKey($module_info, 'name', SORT_STRING | SORT_FLAG_CASE);
+ 
+-    uasort($module_info, 'system_sort_modules_by_info_name');
+     $menu_items = array();
+-
+     foreach ($module_info as $module => $info) {
+       // Only display a section if there are any available tasks.
+-      if ($admin_tasks = system_get_module_admin_tasks($module, $info->info)) {
++      if ($admin_tasks = system_get_module_admin_tasks($module, $info)) {
+         // Sort links by title.
+-        uasort($admin_tasks, array('\Drupal\Component\Utility\SortArray', 'sortByTitleElement'));
++        $admin_tasks = StableSort::sortArraysByWeightKey($admin_tasks, 'title', SORT_NATURAL | SORT_FLAG_CASE);
+         // Move 'Configure permissions' links to the bottom of each section.
+         $permission_key = "user.admin_permissions.$module";
+         if (isset($admin_tasks[$permission_key])) {
+@@ -38,7 +34,7 @@ public function index() {
+           $admin_tasks[$permission_key] = $permission_task;
+         }
+ 
+-        $menu_items[$info->info['name']] = array($info->info['description'], $admin_tasks);
++        $menu_items[$info['name']] = array($info['description'], $admin_tasks);
+       }
+     }
+ 
+diff --git a/core/modules/system/src/Controller/SystemController.php b/core/modules/system/src/Controller/SystemController.php
+index 98d6179..fb789e0 100644
+--- a/core/modules/system/src/Controller/SystemController.php
++++ b/core/modules/system/src/Controller/SystemController.php
+@@ -5,6 +5,8 @@
+ use Drupal\Core\Cache\CacheableMetadata;
+ use Drupal\Core\Controller\ControllerBase;
+ use Drupal\Core\Entity\Query\QueryFactory;
++use Drupal\Core\Extension\Extension;
++use Drupal\Core\Extension\ThemeHandler;
+ use Drupal\Core\Extension\ThemeHandlerInterface;
+ use Drupal\Core\Form\FormBuilderInterface;
+ use Drupal\Core\Menu\MenuLinkTreeInterface;
+@@ -196,7 +198,7 @@ public function themesPage() {
+     $config = $this->config('system.theme');
+     // Get all available themes.
+     $themes = $this->themeHandler->rebuildThemeData();
+-    uasort($themes, 'system_sort_modules_by_info_name');
++    $themes = Extension::sortExtensionsByInfoName($themes);
+ 
+     $theme_default = $config->get('default');
+     $theme_groups  = array('installed' => array(), 'uninstalled' => array());
+@@ -322,7 +324,7 @@ public function themesPage() {
+       $theme_group_titles['uninstalled'] = $this->formatPlural(count($theme_groups['uninstalled']), 'Uninstalled theme', 'Uninstalled themes');
+     }
+ 
+-    uasort($theme_groups['installed'], 'system_sort_themes');
++    $theme_groups['installed'] = ThemeHandler::sortThemes($theme_groups['installed']);
+     $this->moduleHandler()->alter('system_themes_page', $theme_groups);
+ 
+     $build = array();
+diff --git a/core/modules/system/src/Form/ModulesListForm.php b/core/modules/system/src/Form/ModulesListForm.php
+index 7831c38..448ce7d 100644
+--- a/core/modules/system/src/Form/ModulesListForm.php
++++ b/core/modules/system/src/Form/ModulesListForm.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\system\Form;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Component\Utility\Unicode;
+ use Drupal\Core\Config\PreExistingConfigException;
+ use Drupal\Core\Config\UnmetDependenciesException;
+@@ -142,7 +143,7 @@ public function buildForm(array $form, FormStateInterface $form_state) {
+ 
+     // Sort all modules by their names.
+     $modules = system_rebuild_module_data();
+-    uasort($modules, 'system_sort_modules_by_info_name');
++    $modules = Extension::sortExtensionsByInfoName($modules);
+ 
+     // Iterate over each of the modules.
+     $form['modules']['#tree'] = TRUE;
+@@ -173,7 +174,7 @@ public function buildForm(array $form, FormStateInterface $form_state) {
+     }
+ 
+     // Lastly, sort all packages by title.
+-    uasort($form['modules'], array('\Drupal\Component\Utility\SortArray', 'sortByTitleProperty'));
++    $form['modules'] = StableSort::sortMixedByWeightKey($form['modules'], '#title', SORT_NATURAL | SORT_FLAG_CASE);
+ 
+     $form['#attached']['library'][] = 'system/drupal.system.modules';
+     $form['actions'] = array('#type' => 'actions');
+diff --git a/core/modules/system/src/Form/ModulesUninstallForm.php b/core/modules/system/src/Form/ModulesUninstallForm.php
+index a06810e..9a19b48 100644
+--- a/core/modules/system/src/Form/ModulesUninstallForm.php
++++ b/core/modules/system/src/Form/ModulesUninstallForm.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\system\Form;
+ 
++use Drupal\Core\Extension\Extension;
+ use Drupal\Core\Extension\ModuleHandlerInterface;
+ use Drupal\Core\Extension\ModuleInstallerInterface;
+ use Drupal\Core\Form\FormBase;
+@@ -117,7 +118,7 @@ public function buildForm(array $form, FormStateInterface $form_state) {
+     $profile = drupal_get_profile();
+ 
+     // Sort all modules by their name.
+-    uasort($uninstallable, 'system_sort_modules_by_info_name');
++    $uninstallable = Extension::sortExtensionsByInfoName($uninstallable);
+     $validation_reasons = $this->moduleInstaller->validateUninstall(array_keys($uninstallable));
+ 
+     $form['uninstall'] = array('#tree' => TRUE);
+diff --git a/core/modules/system/system.install b/core/modules/system/system.install
+index c7cc531..608c686 100644
+--- a/core/modules/system/system.install
++++ b/core/modules/system/system.install
+@@ -7,6 +7,7 @@
+ 
+ use Drupal\Component\Utility\Crypt;
+ use Drupal\Component\Utility\Environment;
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Path\AliasStorage;
+ use Drupal\Core\Url;
+ use Drupal\Core\Database\Database;
+@@ -1204,16 +1205,16 @@ function system_update_8005() {
+         // to content region.
+         $weight = -6;
+         $blocks = [];
++        $weights = [];
+         foreach ($config_factory->listAll('block.block.') as $block_config) {
+           $block = $config_factory->getEditable($block_config);
+           if ($block->get('theme') == 'bartik' && $block->get('region') == 'help') {
+             $blocks[] = $block;
++            $weights[] = $block->get('weight');
+           }
+         }
+         // Sort blocks by block weight.
+-        uasort($blocks, function ($a, $b) {
+-          return $a->get('weight') - $b->get('weight');
+-        });
++        $blocks = StableSort::sortByMultisortArgs($blocks, [$weights, SORT_NUMERIC]);
+         // Move blocks to content region and set them in right order by their
+         // weight.
+         foreach ($blocks as $block) {
+diff --git a/core/modules/taxonomy/src/Form/OverviewTerms.php b/core/modules/taxonomy/src/Form/OverviewTerms.php
+index cdc6619..d628c3f 100644
+--- a/core/modules/taxonomy/src/Form/OverviewTerms.php
++++ b/core/modules/taxonomy/src/Form/OverviewTerms.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\taxonomy\Form;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Entity\EntityManagerInterface;
+ use Drupal\Core\Form\FormBase;
+ use Drupal\Core\Extension\ModuleHandlerInterface;
+@@ -378,7 +379,8 @@ public function buildForm(array $form, FormStateInterface $form_state, Vocabular
+    */
+   public function submitForm(array &$form, FormStateInterface $form_state) {
+     // Sort term order based on weight.
+-    uasort($form_state->getValue('terms'), array('Drupal\Component\Utility\SortArray', 'sortByWeightElement'));
++    $form_state_terms =& $form_state->getValue('terms');
++    $form_state_terms = StableSort::sortMixedByWeightKey($form_state_terms);
+ 
+     $vocabulary = $form_state->get(['taxonomy', 'vocabulary']);
+     // Update the current hierarchy type as we go.
+diff --git a/core/modules/toolbar/src/Element/Toolbar.php b/core/modules/toolbar/src/Element/Toolbar.php
+index 69a53db..e089b1c 100644
+--- a/core/modules/toolbar/src/Element/Toolbar.php
++++ b/core/modules/toolbar/src/Element/Toolbar.php
+@@ -3,6 +3,7 @@
+ namespace Drupal\toolbar\Element;
+ 
+ use Drupal\Component\Utility\Html;
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Render\Element\RenderElement;
+ use Drupal\Core\Render\Element;
+ 
+@@ -82,7 +83,7 @@ public static function preRenderToolbar($element) {
+     // Allow for altering of hook_toolbar().
+     $module_handler->alter('toolbar', $items);
+     // Sort the children.
+-    uasort($items, array('\Drupal\Component\Utility\SortArray', 'sortByWeightProperty'));
++    $items = StableSort::sortMixedByWeightKey($items, '#weight');
+ 
+     // Merge in the original toolbar values.
+     $element = array_merge($element, $items);
+diff --git a/core/modules/tour/src/Entity/Tour.php b/core/modules/tour/src/Entity/Tour.php
+index 290d3f8..431399e 100644
+--- a/core/modules/tour/src/Entity/Tour.php
++++ b/core/modules/tour/src/Entity/Tour.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\tour\Entity;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Config\Entity\ConfigEntityBase;
+ use Drupal\tour\TipsPluginCollection;
+ use Drupal\tour\TourInterface;
+@@ -110,15 +111,12 @@ public function getTip($id) {
+    */
+   public function getTips() {
+     $tips = array();
++    $weights = [];
+     foreach ($this->tips as $id => $tip) {
+-      $tips[] = $this->getTip($id);
++      $tips[] = $tip = $this->getTip($id);
++      $weights[] = $tip->getWeight();
+     }
+-    uasort($tips, function ($a, $b) {
+-      if ($a->getWeight() == $b->getWeight()) {
+-        return 0;
+-      }
+-      return ($a->getWeight() < $b->getWeight()) ? -1 : 1;
+-    });
++    $tips = StableSort::sortByWeights($tips, $weights, SORT_REGULAR);
+ 
+     \Drupal::moduleHandler()->alter('tour_tips', $tips, $this);
+     return array_values($tips);
+diff --git a/core/modules/tour/src/Plugin/HelpSection/TourHelpSection.php b/core/modules/tour/src/Plugin/HelpSection/TourHelpSection.php
+index c12f58a..bda092a 100644
+--- a/core/modules/tour/src/Plugin/HelpSection/TourHelpSection.php
++++ b/core/modules/tour/src/Plugin/HelpSection/TourHelpSection.php
+@@ -7,6 +7,7 @@
+ use Drupal\Core\Plugin\ContainerFactoryPluginInterface;
+ use Drupal\Core\Url;
+ use Drupal\help\Plugin\HelpSection\HelpSectionPluginBase;
++use Drupal\tour\Entity\Tour;
+ use Symfony\Component\DependencyInjection\ContainerInterface;
+ 
+ /**
+@@ -77,7 +78,7 @@ public function listTopics() {
+     /** @var \Drupal\tour\TourInterface[] $tours */
+     $tours = $this->entityTypeManager->getStorage('tour')->loadMultiple();
+     // Sort in the manner defined by Tour.
+-    uasort($tours, ['Drupal\tour\Entity\Tour', 'sort']);
++    $tours = Tour::sortConfigEntities($tours);
+ 
+     // Make a link to each tour, using the first of its routes that can
+     // be linked to by this user, if any.
+diff --git a/core/modules/update/update.install b/core/modules/update/update.install
+index e810129..e5ac356 100644
+--- a/core/modules/update/update.install
++++ b/core/modules/update/update.install
+@@ -42,7 +42,7 @@ function update_requirements($phase) {
+         // status constants are numbered in the right order of precedence, so
+         // we just need to make sure the projects are sorted in ascending
+         // order of status, and we can look at the first project we find.
+-        uasort($data, '_update_project_status_sort');
++        $data = _update_project_status_sort_projects($data);
+         $first_project = reset($data);
+         $requirements['update_contrib'] = _update_requirement_check($first_project, 'contrib');
+       }
+diff --git a/core/modules/update/update.module b/core/modules/update/update.module
+index 349f694..09e2007 100644
+--- a/core/modules/update/update.module
++++ b/core/modules/update/update.module
+@@ -11,6 +11,7 @@
+  * ability to install contributed modules and themes via an user interface.
+  */
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Url;
+ use Drupal\Core\Form\FormStateInterface;
+ use Drupal\Core\Routing\RouteMatchInterface;
+@@ -550,6 +551,27 @@ function _update_project_status_sort($a, $b) {
+ }
+ 
+ /**
++ * Sorts projects based on their status.
++ *
++ * @param array[] $projects
++ *
++ * @return array[]
++ */
++function _update_project_status_sort_projects(array $projects) {
++  $weights = [];
++  foreach ($projects as $project) {
++    // The status constants are numerically in the right order, so we can
++    // usually subtract the two to compare in the order we want. However,
++    // negative status values should be treated as if they are huge, since we
++    // always want them at the bottom of the list.
++    $weights[] = $project['status'] > 0
++      ? $project['status']
++      : $project['status'] * -10;
++  }
++  return StableSort::sortByWeights($projects, $weights, SORT_NUMERIC);
++}
++
++/**
+  * Prepares variables for last time update data was checked templates.
+  *
+  * Default template: update-last-check.html.twig.
+diff --git a/core/modules/user/src/Entity/Role.php b/core/modules/user/src/Entity/Role.php
+index 5ecbc02..c0b010c 100644
+--- a/core/modules/user/src/Entity/Role.php
++++ b/core/modules/user/src/Entity/Role.php
+@@ -161,7 +161,7 @@ public function setIsAdmin($is_admin) {
+   public static function postLoad(EntityStorageInterface $storage, array &$entities) {
+     parent::postLoad($storage, $entities);
+     // Sort the queried roles by their weight.
+-    // See \Drupal\Core\Config\Entity\ConfigEntityBase::sort().
++    /* @see \Drupal\Core\Config\Entity\ConfigEntityBase::sort() */
+     uasort($entities, 'static::sort');
+   }
+ 
+diff --git a/core/modules/user/src/PermissionHandler.php b/core/modules/user/src/PermissionHandler.php
+index 3a4e6c4..5a79652 100644
+--- a/core/modules/user/src/PermissionHandler.php
++++ b/core/modules/user/src/PermissionHandler.php
+@@ -3,6 +3,7 @@
+ namespace Drupal\user;
+ 
+ use Drupal\Component\Discovery\YamlDiscovery;
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Controller\ControllerResolverInterface;
+ use Drupal\Core\Extension\ModuleHandlerInterface;
+ use Drupal\Core\StringTranslation\StringTranslationTrait;
+@@ -202,16 +203,32 @@ protected function sortPermissions(array $all_permissions = array()) {
+     // Get a list of all the modules providing permissions and sort by
+     // display name.
+     $modules = $this->getModuleNames();
++    return static::sortPermissionsStatic($all_permissions, $modules);
++  }
+ 
+-    uasort($all_permissions, function (array $permission_a, array $permission_b) use ($modules) {
+-      if ($modules[$permission_a['provider']] == $modules[$permission_b['provider']]) {
+-        return $permission_a['title'] > $permission_b['title'];
+-      }
+-      else {
+-        return $modules[$permission_a['provider']] > $modules[$permission_b['provider']];
+-      }
+-    });
+-    return $all_permissions;
++  /**
++   * Sorts permissions by provider name and title.
++   *
++   * This method is static for easier testing.
++   *
++   * @param array[] $all_permissions
++   * @param string[] $modules
++   *   Format: $[$module_machine_name] = $module_human_name
++   *
++   * @return array[]
++   *   Sorted permissions
++   */
++  public static function sortPermissionsStatic(array $all_permissions, array $modules) {
++    $providers = [];
++    $titles = [];
++    foreach ($all_permissions as $permission) {
++      $providers[] = $modules[$permission['provider']];
++      $titles[] = $permission['title'];
++    }
++
++    return StableSort::sortByMultisortArgs(
++      $all_permissions,
++      [$providers, $titles]);
+   }
+ 
+   /**
+diff --git a/core/modules/user/tests/src/Unit/PermissionHandlerTest.php b/core/modules/user/tests/src/Unit/PermissionHandlerTest.php
+index 593d8c4..47adb3d 100644
+--- a/core/modules/user/tests/src/Unit/PermissionHandlerTest.php
++++ b/core/modules/user/tests/src/Unit/PermissionHandlerTest.php
+@@ -212,6 +212,128 @@ public function testBuildPermissionsSortPerModule() {
+   }
+ 
+   /**
++   * @return mixed[][]
++   *   Format: $[$dataset_name] = [$permissions_unsorted, $modules, $permissions_sorted_expected]
++   */
++  public function providerSortPermissionsStatic() {
++    $modules = [
++      'system' => 'System',
++      'user' => 'User',
++      'menu' => 'Menu',
++      'comment' => 'Comment',
++    ];
++    $datasets = [
++      'zero' => [
++        [],
++        $modules,
++        [],
++      ],
++      'one' => [
++        [
++          'select account cancellation method' => [
++            'title' => 'Select method for cancelling own account',
++            'provider' => 'user',
++          ],
++        ],
++        $modules,
++        [
++          'select account cancellation method' => [
++            'title' => 'Select method for cancelling own account',
++            'provider' => 'user',
++          ],
++        ],
++      ],
++      'multiple' => [
++        [
++          'administer modules' => [
++            'title' => 'Administer modules',
++            'provider' => 'system',
++          ],
++          'select account cancellation method' => [
++            'title' => 'Select method for cancelling own account',
++            'provider' => 'user',
++          ],
++          'link to any page' => [
++            'title' => 'Link to any page',
++            'restrict access' => true,
++            'provider' => 'system',
++          ],
++          'administer menu' => [
++            'title' => 'Administer menu',
++            'restrict access' => true,
++            'provider' => 'system',
++          ],
++          'post comments' => [
++            'title' => 'Post comments',
++            'provider' => 'comment',
++          ],
++        ],
++        $modules,
++        [
++          // Sorted by provider module name first, then by permission name.
++          'post comments' => [
++            'title' => 'Post comments',
++            'provider' => 'comment',
++          ],
++          'administer menu' => [
++            'title' => 'Administer menu',
++            'restrict access' => true,
++            'provider' => 'system',
++          ],
++          'administer modules' => [
++            'title' => 'Administer modules',
++            'provider' => 'system',
++          ],
++          'link to any page' => [
++            'title' => 'Link to any page',
++            'restrict access' => true,
++            'provider' => 'system',
++          ],
++          'select account cancellation method' => [
++            'title' => 'Select method for cancelling own account',
++            'provider' => 'user',
++          ],
++        ],
++      ],
++      // The sort must not break with TranslatableMarkup.
++      'translatable markup' => [
++        [],
++        $modules,
++        [
++          'post comments' => [],
++          'administer menu' => [],
++          'administer modules' => [],
++          'link to any page' => [],
++          'select account cancellation method' => [],
++        ],
++      ],
++    ];
++
++    foreach ($datasets['multiple'][0] as $k => $permission) {
++      $permission['title'] = new TranslatableMarkup($permission['title']);
++      $datasets['translatable markup'][0][$k] = $permission;
++      $datasets['translatable markup'][2][$k] = $permission;
++    }
++
++    return $datasets;
++  }
++
++  /**
++   * @param array $permissions_unsorted
++   * @param array $modules
++   * @param array $permissions_sorted_expected
++   *
++   * @covers ::sortPermissionsStatic
++   * @dataProvider providerSortPermissionsStatic
++   */
++  public function testSortPermissionsStatic(array $permissions_unsorted, array $modules, array $permissions_sorted_expected) {
++    $permissions_sorted = PermissionHandler::sortPermissionsStatic($permissions_unsorted, $modules);
++    $this->assertEquals($permissions_sorted_expected, $permissions_sorted);
++    $this->assertEquals(array_keys($permissions_sorted_expected), array_keys($permissions_sorted));
++    $this->assertSame($permissions_sorted_expected, $permissions_sorted);
++  }
++
++  /**
+    * Tests dynamic callback permissions provided by YML files.
+    *
+    * @covers ::__construct
+diff --git a/core/modules/views/src/Plugin/views/filter/FilterPluginBase.php b/core/modules/views/src/Plugin/views/filter/FilterPluginBase.php
+index 34b8cb4..70819e0 100644
+--- a/core/modules/views/src/Plugin/views/filter/FilterPluginBase.php
++++ b/core/modules/views/src/Plugin/views/filter/FilterPluginBase.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\views\Plugin\views\filter;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Cache\Cache;
+ use Drupal\Core\Cache\CacheableDependencyInterface;
+ use Drupal\Core\Form\FormHelper;
+@@ -695,7 +696,7 @@ protected function validateIdentifier($identifier, FormStateInterface $form_stat
+   protected function buildGroupSubmit($form, FormStateInterface $form_state) {
+     $groups = array();
+     $group_items = $form_state->getValue(array('options', 'group_info', 'group_items'));
+-    uasort($group_items, array('Drupal\Component\Utility\SortArray', 'sortByWeightElement'));
++    $group_items = StableSort::sortMixedByWeightKey($group_items);
+     // Filter out removed items.
+ 
+     // Start from 1 to avoid problems with #default_value in the widget.
+diff --git a/core/modules/views/src/ViewsData.php b/core/modules/views/src/ViewsData.php
+index 8bb6b53..6d2ae24 100644
+--- a/core/modules/views/src/ViewsData.php
++++ b/core/modules/views/src/ViewsData.php
+@@ -3,6 +3,7 @@
+ namespace Drupal\views;
+ 
+ use Drupal\Component\Utility\NestedArray;
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Cache\Cache;
+ use Drupal\Core\Cache\CacheBackendInterface;
+ use Drupal\Core\Config\ConfigFactoryInterface;
+@@ -310,15 +311,7 @@ public function fetchBaseTables() {
+     }
+ 
+     // Sorts by the 'weight' and then by 'title' element.
+-    uasort($tables, function ($a, $b) {
+-      if ($a['weight'] != $b['weight']) {
+-        return $a['weight'] < $b['weight'] ? -1 : 1;
+-      }
+-      if ($a['title'] != $b['title']) {
+-        return $a['title'] < $b['title'] ? -1 : 1;
+-      }
+-      return 0;
+-    });
++    $tables = StableSort::sortArraysByWeightKeys($tables, ['weight' => SORT_NUMERIC, 'title' => SORT_STRING]);
+ 
+     return $tables;
+   }
+diff --git a/core/modules/views/src/ViewsDataHelper.php b/core/modules/views/src/ViewsDataHelper.php
+index 791cd37..1f54bb4 100644
+--- a/core/modules/views/src/ViewsDataHelper.php
++++ b/core/modules/views/src/ViewsDataHelper.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\views;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Component\Utility\Unicode;
+ use Drupal\Component\Utility\SafeMarkup;
+ 
+@@ -149,12 +150,12 @@ public function fetchFields($base, $type, $grouping = FALSE, $sub_type = NULL) {
+           $strings += $this->fields[$base_table][$type];
+         }
+       }
+-      uasort($strings, array('self', 'fetchedFieldSort'));
++      $strings = self::sortFetchedFields($strings);
+       return $strings;
+     }
+ 
+     if (isset($this->fields[$base][$type])) {
+-      uasort($this->fields[$base][$type], array($this, 'fetchedFieldSort'));
++      $this->fields[$base][$type] = $this->sortFetchedFields($this->fields[$base][$type]);
+       return $this->fields[$base][$type];
+     }
+     return array();
+@@ -189,4 +190,23 @@ protected static function fetchedFieldSort($a, $b) {
+     return 0;
+   }
+ 
++  /**
++   * Sorts fetched fields.
++   *
++   * @param array[] $fields
++   *   Format: $[$k] = ['group' => .., 'title' => .., ..]
++   *
++   * @return array[]
++   *   Format: $[$k] === $fields[$k]
++   */
++  public static function sortFetchedFields(array $fields) {
++    $groups = [];
++    $titles = [];
++    foreach ($fields as $field) {
++      $groups[] = Unicode::strtolower($field['group']);
++      $titles[] = Unicode::strtolower($field['title']);
++    }
++    return StableSort::sortByMultisortArgs($fields, [$groups, SORT_STRING, $titles, SORT_STRING]);
++  }
++
+ }
+diff --git a/core/modules/views/views.views.inc b/core/modules/views/views.views.inc
+index aca4b8a..ece07cc 100644
+--- a/core/modules/views/views.views.inc
++++ b/core/modules/views/views.views.inc
+@@ -259,20 +259,16 @@ function views_entity_field_label($entity_type, $field_name) {
+       $all_labels[$label] = TRUE;
+     }
+   }
+-  if (empty($label_counter)) {
++  if ($label_counter === []) {
+     return array($field_name, $all_labels);
+   }
+-  // Sort the field labels by it most used label and return the most used one.
+-  // If the counts are equal, sort by the label to ensure the result is
+-  // deterministic.
+-  uksort($label_counter, function($a, $b) use ($label_counter) {
+-    if ($label_counter[$a] === $label_counter[$b]) {
+-      return strcmp($a, $b);
+-    }
+-    return $label_counter[$a] > $label_counter[$b] ? -1 : 1;
+-  });
+-  $label_counter = array_keys($label_counter);
+-  return array($label_counter[0], $all_labels);
++  // Determine the most used label.
++  $highest_count = max($label_counter);
++  $highest_count_labels = array_keys($label_counter, $highest_count, TRUE);
++  // If there is a tie, sort labels to be deterministic.
++  sort($highest_count_labels, SORT_STRING);
++
++  return [$highest_count_labels[0], $all_labels];
+ }
+ 
+ /**
+diff --git a/core/modules/views_ui/src/Form/Ajax/ReorderDisplays.php b/core/modules/views_ui/src/Form/Ajax/ReorderDisplays.php
+index 7d1285f..c1a0df5 100644
+--- a/core/modules/views_ui/src/Form/Ajax/ReorderDisplays.php
++++ b/core/modules/views_ui/src/Form/Ajax/ReorderDisplays.php
+@@ -3,6 +3,7 @@
+ namespace Drupal\views_ui\Form\Ajax;
+ 
+ use Drupal\Component\Utility\SafeMarkup;
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Form\FormStateInterface;
+ use Drupal\Core\Url;
+ 
+@@ -49,12 +50,7 @@ public function buildForm(array $form, FormStateInterface $form_state) {
+     $count = count($displays);
+ 
+     // Sort the displays.
+-    uasort($displays, function ($display1, $display2) {
+-      if ($display1['position'] != $display2['position']) {
+-        return $display1['position'] < $display2['position'] ? -1 : 1;
+-      }
+-      return 0;
+-    });
++    $displays = StableSort::sortArraysByWeightKey($displays, 'position', SORT_REGULAR);
+ 
+     $form['displays'] = array(
+       '#type' => 'table',
+diff --git a/core/modules/views_ui/src/ViewFormBase.php b/core/modules/views_ui/src/ViewFormBase.php
+index 1533b80..c5cdf9f 100644
+--- a/core/modules/views_ui/src/ViewFormBase.php
++++ b/core/modules/views_ui/src/ViewFormBase.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\views_ui;
+ 
++use Drupal\Component\Utility\StableSort;
+ use Drupal\Core\Entity\EntityForm;
+ use Drupal\Core\Form\FormStateInterface;
+ use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+@@ -50,7 +51,7 @@ protected function prepareEntity() {
+       if (empty($this->displayID)) {
+         // If a display isn't specified, use the first one after sorting by
+         // #weight.
+-        uasort($tabs, 'Drupal\Component\Utility\SortArray::sortByWeightProperty');
++        $tabs = StableSort::sortMixedByWeightKey($tabs, '#weight', SORT_NUMERIC);
+         foreach ($tabs as $id => $tab) {
+           if (!isset($tab['#access']) || $tab['#access']) {
+             $this->displayID = $id;
+diff --git a/core/tests/Drupal/Tests/Component/Utility/StableSortTest.php b/core/tests/Drupal/Tests/Component/Utility/StableSortTest.php
+new file mode 100644
+index 0000000..607d380
+--- /dev/null
++++ b/core/tests/Drupal/Tests/Component/Utility/StableSortTest.php
+@@ -0,0 +1,764 @@
++<?php
++
++namespace Drupal\Tests\Component\Utility;
++
++use Drupal\Component\Utility\StableSort;
++use Drupal\Tests\UnitTestCase;
++
++/**
++ * Tests the StableSort component.
++ *
++ * @group Utility
++ *
++ * @coversDefaultClass \Drupal\Component\Utility\StableSort
++ */
++class StableSortTest extends UnitTestCase {
++
++  /**
++   * @covers ::sortFlagsGetNeutralWeight
++   */
++  public function testSortFlagsGetNeutralWeight() {
++    static::assertSame(0, StableSort::sortFlagsGetNeutralWeight(SORT_NUMERIC));
++    static::assertSame('', StableSort::sortFlagsGetNeutralWeight(SORT_STRING));
++    static::assertSame('', StableSort::sortFlagsGetNeutralWeight(SORT_STRING | SORT_FLAG_CASE));
++    static::assertSame('', StableSort::sortFlagsGetNeutralWeight(SORT_REGULAR));
++    static::assertSame('', StableSort::sortFlagsGetNeutralWeight(SORT_NATURAL));
++    static::assertSame('', StableSort::sortFlagsGetNeutralWeight(SORT_NATURAL | SORT_FLAG_CASE));
++    static::assertSame('', StableSort::sortFlagsGetNeutralWeight(SORT_LOCALE_STRING));
++  }
++
++  /**
++   * @return mixed[][]
++   *   Format: $[$dataset_name] = [$values_unsorted, $values_sorted_expected]
++   */
++  public function providerSortByValue() {
++
++    return [
++      'zero' => [
++        [],
++        [],
++      ],
++      'one' => [
++        [
++          'a' => 0,
++        ],
++        [
++          'a' => 0,
++        ],
++      ],
++      'multiple' => [
++        [
++          'a' => 0,
++          'b' => 1,
++          'c' => 0,
++          'd' => -1,
++        ],
++        [
++          'd' => -1,
++          'a' => 0,
++          'c' => 0,
++          'b' => 1,
++        ],
++      ],
++    ];
++  }
++
++  /**
++   * @param array $values_unsorted
++   * @param array $values_sorted_expected
++   *
++   * @covers ::sortByValue
++   * @dataProvider providerSortByValue
++   */
++  public function testSortByValue(array $values_unsorted, array $values_sorted_expected) {
++    static::assertSameArrays(
++      $values_sorted_expected,
++      StableSort::sortByValue($values_unsorted, SORT_NUMERIC));
++  }
++
++  /**
++   * @return mixed[][]
++   *   Format: $[$dataset_name] = [$items_unsorted, $items_sorted_expected]
++   */
++  public function providerSortMixedByWeightKey() {
++
++    return [
++      'zero' => [
++        [],
++        [],
++      ],
++      'one' => [
++        [
++          'a' => ['pos 0', 'weight' => -10],
++        ],
++        [
++          'a' => ['pos 0', 'weight' => -10],
++        ],
++      ],
++      'multiple' => [
++        $items_unsorted = [
++          0 => ['pos 0', 'weight' => -10],
++          1 => ['pos 1'],
++          2 => ['pos 2', 'weight' => 2],
++          3 => ['pos 3'],
++          4 => ['pos 4', 'weight' => 0.2],
++          5 => ['pos 5', 'weight' => 0.1],
++          8 => ['pos 8', 'weight' => 0],
++          'x' => ['x', 'weight' => 0],
++          'y' => ['y', 'weight' => 0],
++          'z' => ['z', 'weight' => 2],
++          // Example for a non-array item.
++          'obj' => new \stdClass,
++          10 => ['pos 10', 'weight' => -5],
++          11 => ['pos 11', 'weight' => -7],
++        ],
++        [
++          0 => ['pos 0', 'weight' => -10],
++          11 => ['pos 11', 'weight' => -7],
++          10 => ['pos 10', 'weight' => -5],
++          1 => ['pos 1'],
++          3 => ['pos 3'],
++          8 => ['pos 8', 'weight' => 0],
++          'x' => ['x', 'weight' => 0],
++          'y' => ['y', 'weight' => 0],
++          'obj' => $items_unsorted['obj'],
++          5 => ['pos 5', 'weight' => 0.1],
++          4 => ['pos 4', 'weight' => 0.2],
++          2 => ['pos 2', 'weight' => 2],
++          'z' => ['z', 'weight' => 2],
++        ],
++      ],
++    ];
++  }
++
++  /**
++   * @param array $items_unsorted
++   * @param array $items_sorted_expected
++   *
++   * @covers ::sortMixedByWeightKey
++   * @dataProvider providerSortMixedByWeightKey
++   */
++  public function testSortMixedByWeightKey(array $items_unsorted, array $items_sorted_expected) {
++    static::assertSameArrays(
++      $items_sorted_expected,
++      StableSort::sortMixedByWeightKey($items_unsorted, 'weight', SORT_NUMERIC));
++  }
++
++  /**
++   * @return mixed[][]
++   *   Format: $[$dataset_name] = [$items_unsorted, $items_sorted_expected]
++   */
++  public function providerSortArraysByWeightKey() {
++
++    return [
++      'zero' => [
++        [],
++        [],
++      ],
++      'one' => [
++        [
++          'a' => ['pos 0', 'weight' => -10],
++        ],
++        [
++          'a' => ['pos 0', 'weight' => -10],
++        ],
++      ],
++      'multiple' => [
++        [
++          0 => ['pos 0', 'weight' => -10],
++          1 => ['pos 1'],
++          2 => ['pos 2', 'weight' => 2],
++          3 => ['pos 3'],
++          4 => ['pos 4', 'weight' => 0.2],
++          5 => ['pos 5', 'weight' => 0.1],
++          8 => ['pos 8', 'weight' => 0],
++          'x' => ['x', 'weight' => 0],
++          'y' => ['y', 'weight' => 0],
++          'z' => ['z', 'weight' => 2],
++          10 => ['pos 10', 'weight' => -5],
++          11 => ['pos 11', 'weight' => -7],
++        ],
++        [
++          0 => ['pos 0', 'weight' => -10],
++          11 => ['pos 11', 'weight' => -7],
++          10 => ['pos 10', 'weight' => -5],
++          1 => ['pos 1'],
++          3 => ['pos 3'],
++          8 => ['pos 8', 'weight' => 0],
++          'x' => ['x', 'weight' => 0],
++          'y' => ['y', 'weight' => 0],
++          5 => ['pos 5', 'weight' => 0.1],
++          4 => ['pos 4', 'weight' => 0.2],
++          2 => ['pos 2', 'weight' => 2],
++          'z' => ['z', 'weight' => 2],
++        ],
++      ],
++    ];
++  }
++
++  /**
++   * @param array $items_unsorted
++   * @param array $items_sorted_expected
++   *
++   * @covers ::sortArraysByWeightKey
++   * @dataProvider providerSortArraysByWeightKey
++   */
++  public function testSortArraysByWeightKey(array $items_unsorted, array $items_sorted_expected) {
++    static::assertSameArrays(
++      $items_sorted_expected,
++      StableSort::sortArraysByWeightKey($items_unsorted, 'weight', SORT_NUMERIC));
++  }
++
++  /**
++   * @return mixed[][]
++   *   Format: $[$dataset_name] = [$items_unsorted, $items_sorted_expected]
++   */
++  public function providerSortByWeightCallback() {
++
++    return [
++      'zero' => [
++        [],
++        [],
++      ],
++      'one' => [
++        [
++          'a' => 'A',
++        ],
++        [
++          'a' => 'A',
++        ],
++      ],
++      'multiple' => [
++        $items_unsorted = [
++          'a' => 'horse',
++          'b' => 'chicken',
++          'c' => 123,
++          'd' => '',
++          'e' => 'chicken',
++          'f' => '',
++        ],
++        [
++          'd' => '',
++          'f' => '',
++          'c' => 123,
++          'a' => 'horse',
++          'b' => 'chicken',
++          'e' => 'chicken',
++        ],
++      ],
++    ];
++  }
++
++  /**
++   * @param array $items_unsorted
++   * @param array $items_sorted_expected
++   *
++   * @covers ::sortByWeightCallback
++   * @dataProvider providerSortByWeightCallback
++   */
++  public function testSortByWeightCallback(array $items_unsorted, array $items_sorted_expected) {
++    static::assertSameArrays(
++      $items_sorted_expected,
++      StableSort::sortByWeightCallback($items_unsorted, 'strlen'));
++  }
++
++  /**
++   * @return mixed[][]
++   *   Format: $[$dataset_name] = [$items_unsorted, $weights, $items_sorted_expected]
++   */
++  public function providerSortByWeights() {
++
++    return [
++      'zero' => [
++        [],
++        [],
++        [],
++      ],
++      'one' => [
++        [
++          'a' => 'A',
++        ],
++        [1],
++        [
++          'a' => 'A',
++        ],
++      ],
++      'multiple' => [
++        $items_unsorted = [
++          'a' => 'A',
++          'b' => 'B',
++          'c' => 'C',
++          'd' => 'D',
++          'e' => 'E',
++        ],
++        [1, 0, 0, -1, 2],
++        [
++          'd' => 'D',
++          'b' => 'B',
++          'c' => 'C',
++          'a' => 'A',
++          'e' => 'E',
++        ],
++      ],
++    ];
++  }
++
++  /**
++   * @param array $items_unsorted
++   * @param array $weights
++   * @param array $items_sorted_expected
++   *
++   * @covers ::sortByWeights
++   * @dataProvider providerSortByWeights
++   */
++  public function testSortByWeights(array $items_unsorted, array $weights, array $items_sorted_expected) {
++    static::assertSameArrays(
++      $items_sorted_expected,
++      StableSort::sortByWeights($items_unsorted, $weights, SORT_NUMERIC));
++  }
++
++  /**
++   * @return mixed[][]
++   *   Format: $[$dataset_name] = [$items_unsorted, $items_sorted_expected]
++   */
++  public function providerSortMixedByWeightKeys() {
++
++    return [
++      'zero' => [
++        [],
++        [],
++      ],
++      'one' => [
++        [
++          0 => ['pos 0', 'weight' => -10],
++        ],
++        [
++          0 => ['pos 0', 'weight' => -10],
++        ],
++      ],
++      'multiple' => [
++        $items_unsorted = [
++          0 => ['pos 0', 'weight' => -10],
++          1 => ['pos 1', 'b'],
++          2 => ['pos 2', 'weight' => 2],
++          3 => ['pos 3', 'a'],
++          // Example for a non-array item.
++          'obj' => new \stdClass,
++          4 => ['pos 4', 'weight' => 0.2],
++          5 => ['pos 5', 'weight' => 0.1],
++          8 => ['pos 8', 'weight' => 0],
++          'x' => ['x', 'weight' => 0],
++          'y' => ['y', 'weight' => 0],
++          'z' => ['z', 'weight' => 2],
++          10 => ['pos 10', 'weight' => -5],
++          11 => ['pos 11', 'weight' => -7],
++        ],
++        [
++          0 => ['pos 0', 'weight' => -10],
++          11 => ['pos 11', 'weight' => -7],
++          10 => ['pos 10', 'weight' => -5],
++          'obj' => $items_unsorted['obj'],
++          8 => ['pos 8', 'weight' => 0],
++          'x' => ['x', 'weight' => 0],
++          'y' => ['y', 'weight' => 0],
++          3 => ['pos 3', 'a'],
++          1 => ['pos 1', 'b'],
++          5 => ['pos 5', 'weight' => 0.1],
++          4 => ['pos 4', 'weight' => 0.2],
++          2 => ['pos 2', 'weight' => 2],
++          'z' => ['z', 'weight' => 2],
++        ],
++      ],
++    ];
++  }
++
++  /**
++   * @param array $items_unsorted
++   * @param array $items_sorted_expected
++   *
++   * @covers ::sortMixedByWeightKeys
++   * @dataProvider providerSortMixedByWeightKeys
++   */
++  public function testSortMixedByWeightKeys(array $items_unsorted, array $items_sorted_expected) {
++
++    $sort_criteria = [
++      'weight' => SORT_NUMERIC,
++      1 => SORT_STRING,
++    ];
++
++    static::assertSameArrays(
++      $items_sorted_expected,
++      StableSort::sortMixedByWeightKeys($items_unsorted, $sort_criteria));
++  }
++
++  /**
++   * @return mixed[][]
++   *   Format: $[$dataset_name] = [$items_unsorted, $items_sorted_expected]
++   */
++  public function providerSortArraysByWeightKeys() {
++
++    return [
++      'zero' => [
++        [],
++        [],
++      ],
++      'one' => [
++        [
++          0 => ['pos 0', 'weight' => -10],
++        ],
++        [
++          0 => ['pos 0', 'weight' => -10],
++        ],
++      ],
++      'multiple' => [
++        [
++          0 => ['pos 0', 'weight' => -10],
++          1 => ['pos 1', 'b'],
++          2 => ['pos 2', 'weight' => 2],
++          3 => ['pos 3', 'a'],
++          4 => ['pos 4', 'weight' => 0.2],
++          5 => ['pos 5', 'weight' => 0.1],
++          8 => ['pos 8', 'weight' => 0],
++          'x' => ['x', 'weight' => 0],
++          'y' => ['y', 'weight' => 0],
++          'z' => ['z', 'weight' => 2],
++          10 => ['pos 10', 'weight' => -5],
++          11 => ['pos 11', 'weight' => -7],
++        ],
++        [
++          0 => ['pos 0', 'weight' => -10],
++          11 => ['pos 11', 'weight' => -7],
++          10 => ['pos 10', 'weight' => -5],
++          8 => ['pos 8', 'weight' => 0],
++          'x' => ['x', 'weight' => 0],
++          'y' => ['y', 'weight' => 0],
++          3 => ['pos 3', 'a'],
++          1 => ['pos 1', 'b'],
++          5 => ['pos 5', 'weight' => 0.1],
++          4 => ['pos 4', 'weight' => 0.2],
++          2 => ['pos 2', 'weight' => 2],
++          'z' => ['z', 'weight' => 2],
++        ],
++      ],
++    ];
++  }
++
++  /**
++   * @param array $items_unsorted
++   * @param array $items_sorted_expected
++   *
++   * @covers ::sortArraysByWeightKeys
++   * @dataProvider providerSortArraysByWeightKeys
++   */
++  public function testSortArraysByWeightKeys(array $items_unsorted, array $items_sorted_expected) {
++
++    $sort_criteria = [
++      'weight' => SORT_NUMERIC,
++      1 => SORT_STRING,
++    ];
++
++    static::assertSameArrays(
++      $items_sorted_expected,
++      StableSort::sortArraysByWeightKeys($items_unsorted, $sort_criteria));
++  }
++
++  /**
++   * @return mixed[][]
++   *   Format: $[$dataset_name] = [$items_unsorted, $items_sorted_expected]
++   */
++  public function providerSortByWeightsCallback() {
++
++    return [
++      'zero' => [
++        [],
++        [],
++      ],
++      'one' => [
++        [
++          0 => ['pos 0', 'weight' => -10],
++        ],
++        [
++          0 => ['pos 0', 'weight' => -10],
++        ],
++      ],
++      'multiple' => [
++        [
++          0 => ['pos 0', 'weight' => -10],
++          1 => ['pos 1', 'b'],
++          2 => ['pos 2', 'weight' => 2],
++          3 => ['pos 3', 'a'],
++          4 => ['pos 4', 'weight' => 0.2],
++          5 => ['pos 5', 'weight' => 0.1],
++          8 => ['pos 8', 'weight' => 0],
++          'x' => ['x', 'weight' => 0],
++          'y' => ['y', 'weight' => 0],
++          'z' => ['z', 'weight' => 2],
++          10 => ['pos 10', 'weight' => -5],
++          11 => ['pos 11', 'weight' => -7],
++        ],
++        [
++          0 => ['pos 0', 'weight' => -10],
++          11 => ['pos 11', 'weight' => -7],
++          10 => ['pos 10', 'weight' => -5],
++          8 => ['pos 8', 'weight' => 0],
++          'x' => ['x', 'weight' => 0],
++          'y' => ['y', 'weight' => 0],
++          3 => ['pos 3', 'a'],
++          1 => ['pos 1', 'b'],
++          5 => ['pos 5', 'weight' => 0.1],
++          4 => ['pos 4', 'weight' => 0.2],
++          2 => ['pos 2', 'weight' => 2],
++          'z' => ['z', 'weight' => 2],
++        ],
++      ],
++    ];
++  }
++
++  /**
++   * @param array $items_unsorted
++   * @param array $items_sorted_expected
++   *
++   * @covers ::sortByWeightsCallback
++   * @dataProvider providerSortByWeightsCallback
++   */
++  public function testSortByWeightsCallback(array $items_unsorted, array $items_sorted_expected) {
++
++    static::assertSameArrays(
++      $items_sorted_expected,
++      StableSort::sortByWeightsCallback(
++        $items_unsorted,
++        function($item) {
++          return [
++            isset($item['weight']) ? $item['weight'] : 0,
++            isset($item[1]) ? $item[1] : '',
++          ];
++        },
++        [SORT_NUMERIC, SORT_STRING]));
++  }
++
++  /**
++   * @return mixed[][]
++   *   Format: $[$dataset_name] = [$arrays, $multisort_args_expected]
++   */
++  public function providerArraysBuildMultisortArgs() {
++
++    return [
++      'zero' => [
++        [],
++        [
++          [],
++          SORT_NUMERIC,
++          SORT_DESC,
++          [],
++          SORT_NATURAL | SORT_FLAG_CASE,
++        ],
++      ],
++      'one' => [
++        [
++          ['weight' => 5, 'title' => 'Broccoli'],
++        ],
++        [
++          [5],
++          SORT_NUMERIC,
++          SORT_DESC,
++          ['Broccoli'],
++          SORT_NATURAL | SORT_FLAG_CASE,
++        ],
++      ],
++      'multiple' => [
++        [
++          ['weight' => 5, 'title' => 'Broccoli'],
++          ['weight' => 2, 'title' => 'Cauliflower'],
++          ['title' => 'Vanilla ice'],
++          ['weight' => 0],
++        ],
++        [
++          [5, 2, 0, 0],
++          SORT_NUMERIC,
++          SORT_DESC,
++          ['Broccoli', 'Cauliflower', 'Vanilla ice', ''],
++          SORT_NATURAL | SORT_FLAG_CASE,
++        ],
++      ],
++    ];
++  }
++
++  /**
++   * @param array $arrays
++   * @param array $multisort_args_expected
++   *
++   * @covers ::arraysBuildMultisortArgs
++   * @dataProvider providerArraysBuildMultisortArgs
++   */
++  public function testArraysBuildMultisortArgs(array $arrays, array $multisort_args_expected) {
++
++    static::assertSameArrays(
++      $multisort_args_expected,
++      StableSort::arraysBuildMultisortArgs(
++        $arrays,
++        ['weight' => SORT_NUMERIC, 'title' => SORT_NATURAL | SORT_FLAG_CASE],
++        ['weight' => SORT_DESC]));
++  }
++
++  /**
++   * @return mixed[][]
++   *   Format: $[$dataset_name] = [$items_unsorted, $multisort_args, $items_sorted_expected]
++   */
++  public function providerSortByMultisortArgs() {
++
++    return [
++      'zero' => [
++        [],
++        [
++          [],
++          SORT_NUMERIC,
++          [],
++          SORT_NATURAL | SORT_FLAG_CASE,
++        ],
++        [],
++      ],
++      'one' => [
++        [
++          'a' => 'A',
++        ],
++        [
++          [1],
++          SORT_NUMERIC,
++          ['z'],
++          SORT_NATURAL | SORT_FLAG_CASE,
++        ],
++        [
++          'a' => 'A',
++        ],
++      ],
++      'multiple' => [
++        [
++          'a' => 'A',
++          'b' => 'B',
++          'c' => 'C',
++          'd' => 'D',
++          'e' => 'E',
++          'f' => 'F',
++          'g' => 'G',
++        ],
++        [
++          [1, 0, 0, -1, 2, 2, 0],
++          SORT_NUMERIC,
++          ['z', 'x', 'x', '', '', 'U', 'u'],
++          SORT_NATURAL | SORT_FLAG_CASE,
++        ],
++        [
++          'd' => 'D',
++          'g' => 'G',
++          'b' => 'B',
++          'c' => 'C',
++          'a' => 'A',
++          'e' => 'E',
++          'f' => 'F',
++        ],
++      ],
++    ];
++  }
++
++  /**
++   * @param array $items_unsorted
++   * @param array $multisort_args
++   * @param array $items_sorted_expected
++   *
++   * @covers ::sortByMultisortArgs
++   * @dataProvider providerSortByMultisortArgs
++   */
++  public function testSortByMultisortArgs(array $items_unsorted, array $multisort_args, array $items_sorted_expected) {
++    static::assertSameArrays(
++      $items_sorted_expected,
++      StableSort::sortByMultisortArgs($items_unsorted, $multisort_args));
++  }
++
++  /**
++   * @return mixed[][]
++   *   Format: $[$dataset_name] = [$items_by_weight, $items_sorted_expected]
++   */
++  public function providerKsortAndMergeGroups() {
++
++    return [
++      'zero' => [
++        [],
++        [],
++      ],
++      'one' => [
++        [
++          5 => [
++            'a' => 'A',
++          ],
++        ],
++        [
++          'a' => 'A',
++        ],
++      ],
++      'multiple' => [
++        $items_by_weight = [
++          5 => [
++            'a' => 'A',
++            'b' => 'B',
++          ],
++          0 => [
++            'c' => 'C',
++            'd' => [],
++          ],
++          1 => [
++            'e' => new \stdClass,
++          ],
++          -1 => [
++            'f' => 'F',
++          ],
++        ],
++        [
++          'f' => 'F',
++          'c' => 'C',
++          'd' => [],
++          'e' => $items_by_weight[1]['e'],
++          'a' => 'A',
++          'b' => 'B',
++        ],
++      ],
++    ];
++  }
++
++  /**
++   * @param array $items_by_weight
++   * @param array $items_sorted_expected
++   *
++   * @covers ::ksortAndMergeGroups
++   * @dataProvider providerKsortAndMergeGroups
++   */
++  public function testKsortAndMergeGroups(array $items_by_weight, array $items_sorted_expected) {
++    static::assertSameArrays(
++      $items_sorted_expected,
++      StableSort::ksortAndMergeGroups($items_by_weight));
++  }
++
++  /**
++   * @param array[] $expected
++   * @param array[] $actual
++   */
++  private static function assertSameArrays(array $expected, array $actual) {
++    static::assertEquals($expected, $actual);
++    static::assertEquals(self::exportArrayOrder($expected), self::exportArrayOrder($actual));
++    static::assertEquals(array_keys($expected), array_keys($actual));
++    static::assertSame($expected, $actual);
++  }
++
++  /**
++   * @param array[] $items
++   *
++   * @return string
++   */
++  private static function exportArrayOrder(array $items) {
++    $lines = [];
++    foreach ($items as $k => $item) {
++      $lines[] = json_encode($k) . ': ' . json_encode($item);
++    }
++    return implode("\n", $lines);
++  }
++
++}
+diff --git a/core/tests/Drupal/Tests/Core/Plugin/DefaultLazyPluginCollectionTest.php b/core/tests/Drupal/Tests/Core/Plugin/DefaultLazyPluginCollectionTest.php
+index fbd6bc2..74c633d 100644
+--- a/core/tests/Drupal/Tests/Core/Plugin/DefaultLazyPluginCollectionTest.php
++++ b/core/tests/Drupal/Tests/Core/Plugin/DefaultLazyPluginCollectionTest.php
+@@ -52,37 +52,61 @@ public function testGetNotExistingPlugin() {
+   }
+ 
+   /**
+-   * Provides test data for testSortHelper.
+-   *
+-   * @return array
+-   *   The test data.
+-   */
+-  public function providerTestSortHelper() {
+-    return array(
+-      array('apple', 'apple', 0),
+-      array('apple', 'cherry', -1),
+-      array('cherry', 'apple', 1),
+-      array('cherry', 'banana', 1),
+-    );
++   * @return mixed[][]
++   *   Format: $[$dataset_name] = [$ids_unsorted, $ids_sorted_expected]
++   */
++  public function providerSortInstanceIds() {
++    return [
++      'zero' => [
++        [],
++        [],
++      ],
++      'one' => [
++        [
++          'apple' => 'apple',
++        ],
++        [
++          'apple' => 'apple',
++        ],
++      ],
++      'multiple' => [
++        [
++          'apple' => 'apple',
++          'cherry' => 'cherry',
++          'banana' => 'banana',
++        ],
++        [
++          'apple' => 'apple',
++          'banana' => 'banana',
++          'cherry' => 'cherry',
++        ],
++      ],
++      // Typically the instance ids array should be like [$id => $id].
++      // The test also covers the behavior for arrays of instance ids which do
++      // not follow this format.
++      'multiple malkeyed' => [
++        [
++          0 => 'banana',
++          1 => 'apple',
++        ],
++        [
++          1 => 'apple',
++          0 => 'banana',
++        ],
++      ],
++    ];
+   }
+ 
+   /**
+-   * @param string $plugin_id_1
+-   *   The first plugin ID.
+-   * @param string $plugin_id_2
+-   *   The second plugin ID.
+-   * @param int $expected
+-   *   The expected result.
++   * @param array $ids_unsorted
++   * @param array $ids_sorted_expected
+    *
+-   * @covers ::sortHelper
+-   * @dataProvider providerTestSortHelper
++   * @covers ::sortInstanceIds
++   * @dataProvider providerSortInstanceIds
+    */
+-  public function testSortHelper($plugin_id_1, $plugin_id_2, $expected) {
++  public function testSortInstanceIds(array $ids_unsorted, array $ids_sorted_expected) {
+     $this->setupPluginCollection($this->any());
+-    if ($expected != 0) {
+-      $expected = $expected > 0 ? 1 : -1;
+-    }
+-    $this->assertEquals($expected, $this->defaultPluginCollection->sortHelper($plugin_id_1, $plugin_id_2));
++    $this->assertSame($ids_sorted_expected, $this->defaultPluginCollection->sortInstanceIds($ids_unsorted));
+   }
+ 
+   /**

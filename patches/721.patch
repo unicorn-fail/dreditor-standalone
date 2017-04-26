@@ -1,0 +1,1078 @@
+From 54a1dcf5ba04580b27045383074353ae065d744f Mon Sep 17 00:00:00 2001
+From: Nathaniel Catchpole <catch@35733.no-reply.drupal.org>
+Date: Wed, 31 Aug 2016 23:09:40 +0100
+Subject: [PATCH 1/4] UP-401: rework service plans (WIP)
+
+---
+ .../custom/tag1_partner/src/Tag1PartnerHelper.php  |  11 --
+ .../custom/tag1_stripe/js/tag1-stripe-form.js      |  51 ++++++
+ .../src/Controller/StripeController.php            | 180 ++++++++++-----------
+ .../custom/tag1_stripe/src/Tag1StripeHelper.php    |  59 ++++++-
+ .../custom/tag1_stripe/tag1_stripe.libraries.yml   |   7 +
+ 5 files changed, 200 insertions(+), 108 deletions(-)
+ create mode 100644 docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js
+
+diff --git a/docroot/modules/custom/tag1_partner/src/Tag1PartnerHelper.php b/docroot/modules/custom/tag1_partner/src/Tag1PartnerHelper.php
+index f0df480..5ae8b3b 100644
+--- a/docroot/modules/custom/tag1_partner/src/Tag1PartnerHelper.php
++++ b/docroot/modules/custom/tag1_partner/src/Tag1PartnerHelper.php
+@@ -148,17 +148,6 @@ public static function hasCustomerServiceLevelNone(AccountInterface $account) {
+   }
+ 
+   /**
+-   * Whether or not user has the Basic service level.
+-   *
+-   * @param \Drupal\Core\Session\AccountInterface $account
+-   *
+-   * @return boolean
+-   */
+-  public static function hasCustomerServiceLevelBasic(AccountInterface $account) {
+-    return static::hasCustomerServiceLevel($account, 'basic');
+-  }
+-
+-  /**
+    * Whether or not user has the Pro service level.
+    *
+    * @param \Drupal\Core\Session\AccountInterface $account
+diff --git a/docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js b/docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js
+new file mode 100644
+index 0000000..774d558
+--- /dev/null
++++ b/docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js
+@@ -0,0 +1,51 @@
++(function ($, drupalSettings) {
++  'use strict';
++
++  /**
++   * Tag1 Stripe Handler.
++   *
++   * @constructor
++   */
++  /**
++   * Drupal behavior for Stripe integration.
++   */
++  Drupal.behaviors.tag1StripeForm = {
++    attach: function (drupalSettings, context) {
++      // Only bind once.
++      $('body').once('stripe-form').each(function () {
++        $('.lts').click(function() {
++          var $this = $(this);
++          var $button = $('.button.stripe');
++          if ($this[0].checked) {
++            $button.attr('data-plan', 'QUO-D6LTS');
++          }
++          else {
++            $button.attr('data-plan', 'QUO-PRO');
++          }
++          Drupal.behaviors.tag1StripeForm.updatePrice(drupalSettings, $button);
++        });
++        $('.quantity').change(function() {
++          $('.quantity option:selected').each(function() {
++            var $button = $('.button.stripe');
++            $button.attr('data-quantity', $(this)[0].value);
++            Drupal.behaviors.tag1StripeForm.updatePrice(drupalSettings, $button);
++          });
++        });
++      });
++    },
++    updatePrice: function (drupalSettings) {
++      var $button = $('.button.stripe');
++      var plan = $button.attr('data-plan');
++      var quantity = $button.attr('data-quantity');
++      // @todo: move prices to drupalSettings.
++      if (plan == 'QUO-PRO') {
++        var price = 1499;
++      }
++      else {
++        var price = 1499 + 14999;
++      }
++      $button.attr('data-amount', quantity * price);
++    }
++  }
++
++})(jQuery, drupalSettings);
+diff --git a/docroot/modules/custom/tag1_stripe/src/Controller/StripeController.php b/docroot/modules/custom/tag1_stripe/src/Controller/StripeController.php
+index 2c2f119..9a70b08 100644
+--- a/docroot/modules/custom/tag1_stripe/src/Controller/StripeController.php
++++ b/docroot/modules/custom/tag1_stripe/src/Controller/StripeController.php
+@@ -57,111 +57,113 @@ public function payment() {
+     }
+ 
+     $build = [
+-      '#theme_wrappers' => ['container__plans'],
+-      '#attributes' => ['class' => ['plans']],
+       // @todo This should be cached by auth user or not, and none service level.
+       '#cache' => [
+         'max-age' => 0,
+       ],
+     ];
+ 
+-    $total_features = 0;
++    $variables = ['@site-name' => \Drupal::config('system.site')->get('name')];
++    $feature_data = [
++      'notifications' => [
++        'label' => $this->t('Notifications'),
++        'description' => $this->t('You can feel confident that you\'ll receive up-to-date information about any security advisories that affect your site(s). @site-name has configurable email notifications and up-to-the-minute status alerts via the Security Dashboard.', $variables),
++      ],
++      'monitoring' => [
++        'label' => $this->t('Monitoring'),
++        'description' => $this->t('@site-name actively monitors your site for any security vulnerabilities. By comparing information about your site to a known set of security advisories, you can be assured that we\'re finding all known vulnerabilities.', $variables),
++      ],
++      'security_dashboard' => [
++        'label' => $this->t('Security Dashboard'),
++        'description' => $this->t('No matter if you\'re monitoring a single site, or several hundred. @site-name provides a convenient and centralized security dashboard where you can quickly understand your security status and take action to address issues.', $variables),
++      ],
+ 
+-    $plans = $this->stripeHelper->getAllServiceLevelData();
+-    foreach ($plans as $service_level => $plan) {
+-      $items = [];
+-      $items['title'] = [
+-        '#wrapper_attributes' => ['class' => ['title']],
+-        '#markup' => $plan['label'],
+-      ];
+-      $items['amount'] = [
+-        '#wrapper_attributes' => ['class' => ['amount']],
+-        '#markup' => $this->stripeHelper->formatMonthlySubscriptionCost($service_level) . '/mo',
+-      ];
+-      $items['description'] = [
+-        '#theme_wrappers' => ['container__plan__description'],
+-        '#wrapper_attributes' => ['class' => ['description']],
+-        '#markup' => $plan['description'],
+-      ];
+-      $features = [];
+-      $i = 0;
+-      foreach ($plan['features'] as $key => $feature) {
+-        $i++;
+-        if ($i > $total_features) {
+-          $total_features = $i;
+-        }
+-        $features[] = [
+-          '#wrapper_attributes' => [
+-            'class' => ['feature', Html::cleanCssIdentifier($key)],
+-            'title' => $feature['description'],
+-          ],
+-          '#type' => 'html_tag',
+-          '#tag' => 'span',
+-          '#value' => $feature['label'],
+-        ];
+-      }
+-      $items['features'] = [
+-        '#wrapper_attributes' => ['class' => ['features']],
+-        '#theme' => 'item_list__plan__features',
+-        '#items' => $features,
++    ];
++    $build['features'] = [
++      '#theme' => 'item_list__plan__features',
++      '#items' => $this->buildFeatureList($feature_data),
+       ];
+ 
+-      // Anonymous users just get a link to sign in or create an account.
+-      if ($current_user->isAnonymous()) {
+-        $items['action'] = [
+-          '#type' => 'link',
+-          '#title' => $this->t('Sign up'),
+-          '#url' => Url::fromRoute('user.register'),
+-          '#wrapper_attributes' => ['class' => ['action']],
+-        ];
+-      }
+-      // Show them the buy button.
+-      else {
+-        $items['action'] = [
+-          '#type' => 'button',
+-          '#value' => $this->t('Buy @label', ['@label' => $plan['label']]),
+-          '#wrapper_attributes' => ['class' => ['action']],
+-          '#attributes' => [
+-            'data-tag1-stripe' => 'true',
+-            'data-callback-url' => Url::fromRoute('tag1_stripe.charge')->toString(),
+-            'data-plan' => $plan['plan'],
+-            'data-amount' => $plan['amount'],
+-            'data-description' => $this->t('@label subscription', ['@label' => $plan['label']]),
+-            'data-panel-label' => $this->t('Subscribe ({{amount}}/month)', ['@service_level' => $service_level]),
+-          ],
+-        ];
+-      }
++    $range = range(0, 3);
++    unset($range[0]);
+ 
+-      $build[$service_level] = [
+-        '#theme' => 'item_list__plan',
+-        '#items' => $items,
+-        '#attributes' => ['class' => ['plan', $service_level]],
+-        '#context' => [
+-          'plan' => $plan,
+-        ],
++    $build['sites'] = [
++      '#type' => 'select',
++      '#title' => $this->t('Number of sites'),
++      '#options' => $range,
++      '#attributes' => ['class' => ['quantity']],
++    ];
++    $build['enterprise'] = [
++      '#type' => 'html_tag',
++      '#tag' => 'span',
++      // @todo: link.
++      '#value' => $this->t('More than three sites? Go enterprise'),
++    ];
++    $build['lts'] = [
++      '#type' => 'checkbox',
++      '#title' => $this->t('Add Drupal 6 LTS'),
++      '#attributes' => ['class' => ['lts']],
++    ];
++    $build['lts_description'] = [
++      '#type' => 'html_tag',
++      '#tag' => 'span',
++      '#attributes' => ['lts-description'],
++      '#value' => $this->t("As a part of the Drupal Security Team, Tag1's expert staff is constantly working to assess and address new security issues. When we find something that affects one of our customers, we develop a solution in tandem with the Drupal community. We are committed to providing support for every project on drupal.org that is used by our customers.", $variables),
++    ];
++    // Anonymous users just get a link to sign in or create an account.
++    if ($current_user->isAnonymous()) {
++      $build['action'] = [
++        '#type' => 'link',
++        '#title' => $this->t('Sign up'),
++        '#url' => Url::fromRoute('user.register'),
++        '#wrapper_attributes' => ['class' => ['action']],
+       ];
+     }
+-
+-    // Fill in missing "features" using an em-dash (to keep vertical sync).
+-    foreach (array_keys($plans) as $service_level) {
+-      $features = &$build[$service_level]['#items']['features']['#items'];
+-      if ($diff = $total_features - count($features)) {
+-        for ($i = 0; $i < $diff; $i++) {
+-          $features[] = [
+-            '#wrapper_attributes' => ['class' => ['feature', 'no-feature']],
+-            '#markup' => '&mdash;',
+-          ];
+-        }
+-      }
++    // Show them the buy button.
++    else {
++      $build['action'] = [
++        '#type' => 'button',
++        '#value' => $this->t('Buy @label', ['@label' => $plan['label']]),
++        '#wrapper_attributes' => ['class' => ['action']],
++        '#attributes' => [
++          'data-tag1-stripe' => 'true',
++          'data-callback-url' => Url::fromRoute('tag1_stripe.charge')->toString(),
++          'data-plan' => 'QUO-PRO',
++          'data-amount' => 1499,
++          'data-quantity' => 1,
++          'data-description' => $this->t('@label subscription', ['@label' => $this->t('Tag1 Quo')]),
++          'data-panel-label' => $this->t('Subscribe ({{amount}}/month)'),
++          'class' => ['stripe'],
++        ],
++      ];
+     }
+-
++    $build['action']['#attached']['library'][] = 'tag1_stripe/stripe.form';
+     // Attach the tag1_stripe library and drupalSettings.
+     $this->stripeHelper->attachLibrary($build, $current_user);
+ 
++
+     return $build;
+   }
+ 
+   /**
++   * Build an #items array given a features array.
++   */
++  protected function buildFeatureList($feature_data) {
++    foreach ($feature_data as $feature) {
++      $features[] = [
++        '#wrapper_attributes' => [
++          'class' => ['feature'],
++          'title' => $feature['description'],
++        ],
++        '#type' => 'html_tag',
++        '#tag' => 'span',
++        '#value' => $feature['label'],
++      ];
++    }
++    return $features;
++  }
++
++  /**
+    * Callback to charge a payment.
+    */
+   public function charge(Request $request) {
+@@ -171,17 +173,15 @@ public function charge(Request $request) {
+ 
+     $current_user = User::load($this->currentUser()->id());
+     $plan = $request_params->get('plan');
++    $quantity = $request_params->get('quantity');
+ 
+     try {
+-      $customer = $this->stripeHelper->createNewCustomerAndSubscription($request_params->get('stripeToken'), $plan, $current_user);
++      $customer = $this->stripeHelper->createNewCustomerAndSubscription($request_params->get('stripeToken'), $plan, $current_user, $quantity);
+ 
+       // Set the service level and stripe customer ID.
+       Tag1PartnerHelper::setCustomerStripeId($current_user, $customer->id);
+ 
+-      $service_level = $this->stripeHelper->getServiceLevelFromPlan($plan);
+-      $service_level_info = $this->stripeHelper->getServiceLevelData($service_level);
+-
+-      Tag1PartnerHelper::setCustomerServiceLevel($current_user, $service_level);
++      Tag1PartnerHelper::setCustomerServiceLevel($current_user, 'pro');
+ 
+       drupal_set_message($this->t('Thank You for buying %level.', ['%level' => $service_level_info['label']]));
+ 
+diff --git a/docroot/modules/custom/tag1_stripe/src/Tag1StripeHelper.php b/docroot/modules/custom/tag1_stripe/src/Tag1StripeHelper.php
+index dbd662c..e05cf80 100644
+--- a/docroot/modules/custom/tag1_stripe/src/Tag1StripeHelper.php
++++ b/docroot/modules/custom/tag1_stripe/src/Tag1StripeHelper.php
+@@ -42,7 +42,7 @@ public function attachLibrary(array &$element, AccountInterface $account = NULL)
+     if (!isset($account)) {
+       $account = \Drupal::currentUser();
+     }
+-    $element['#attached']['library'][] ='tag1_stripe/stripe';
++    $element['#attached']['library'][] = 'tag1_stripe/stripe';
+     $element['#attached']['drupalSettings']['tag1_stripe'] = [
+       'key' => $this->getSetting('public_key'),
+       'name' => $this->t('Tag1 Quo'),
+@@ -80,11 +80,15 @@ public function getSetting($key) {
+   public function getAllServiceLevelData() {
+     $variables = ['@site-name' => \Drupal::config('system.site')->get('name')];
+ 
+-    $plans['basic'] = [
+-      'plan' => 'QUO-BASIC',
+-      'label' => $this->t('Quo Basic'),
+-      'description' => $this->t('Our entry level offering. Be notified of all security issues fixed for our Pro/Enterprise customers that also affect your Drupal 6 website.'),
++    $plans['pro'] = [
++      'plan' => 'QUO-PRO',
++      'label' => $this->t('Quo Pro'),
++      'description' => $this->t('Our entry level offering. Be notified of all security issues fixed for our D6 LTS customers that also affect your Drupal 6 website.'),
+       'amount' => 1499,
++      'addons' =>  [
++        'D6LTS',
++        'ENTERPRISE',
++      ],
+       'features' => [
+         'notifications' => [
+           'label' => $this->t('Notifications'),
+@@ -94,10 +98,16 @@ public function getAllServiceLevelData() {
+           'label' => $this->t('Monitoring'),
+           'description' => $this->t('@site-name actively monitors your site for any security vulnerabilities. By comparing information about your site to a known set of security advisories, you can be assured that we\'re finding all known vulnerabilities.', $variables),
+         ],
++        'security_dashboard' => [
++          'label' => $this->t('Security Dashboard'),
++          'description' => $this->t('No matter if you\'re monitoring a single site, or several hundred. @site-name provides a convenient and centralized security dashboard where you can quickly understand your security status and take action to address issues.', $variables),
++        ],
+       ],
+     ];
+ 
+-    $plans['pro'] = [
++    /**
++
++    $plans['pro_old'] = [
+       'plan' => 'QUO-PRO',
+       'label' => $this->t('Quo Pro'),
+       'description' => $this->t('Includes Drupal 6 Long Term Support and an interactive management portal. Ensure that all your Drupal 6 modules are secure!'),
+@@ -113,7 +123,8 @@ public function getAllServiceLevelData() {
+         ],
+       ]),
+     ];
+-
++*/
++/**
+     $plans['enterprise'] = [
+       'plan' => 'QUO-ENTERPRISE',
+       'label' => $this->t('Quo Enterprise'),
+@@ -131,6 +142,8 @@ public function getAllServiceLevelData() {
+       ]),
+     ];
+ 
++*/
++
+     return $plans;
+   }
+ 
+@@ -147,6 +160,38 @@ public function getServiceLevelData($service_level) {
+   }
+ 
+   /**
++   * Get addons.
++   */
++  public function getAddOns() {
++    $variables = ['@site-name' => \Drupal::config('system.site')->get('name')];
++    $addons['D6LTS'] = [
++      'label' => $this->t('Drupal 6 LTS'),
++      'price' => 14999,
++      'features' => [
++        'patch_development' => [
++          'label' => $this->t('Patch Development'),
++          'description' => $this->t('As a part of the Drupal Security Team, Tag1\'s expert staff is constantly working to assess and address new security issues. When we find something that affects one of our customers, we develop a solution in tandem with the Drupal community. We are committed to providing support for every project on drupal.org that is used by our customers.', $variables),
++        ],
++      ],
++    ];
++    $addons['D6LTS_ENTERPRISE'] = [
++      'label' => $this->t('Drupal 6 LTS Enterprise'),
++      'price' => 59999,
++      'features' => array_merge($plans['pro']['features'], [
++        'deployment_assistance' => [
++          'label' => $this->t('Deployment Assistance'),
++          'description' => $this->t('Management of a major security deployment can be a challenge for customers with many sites or particularly complex ones. Users of @site-name\'s enterprise plan can work with our team of experts to get engineering assistance to help them understand what their security needs are, gain insight into deployment best practices, and have a team of experts available to help.', $variables),
++        ],
++        'special_pricing' => [
++          'label' => $this->t('Special Pricing for Multiple Sites'),
++          'description' => $this->t('We understand that many companies have chosen unique and powerful ways of scaling Drupal as a platform for dozens, hundreds, or even thousands of sites. Tag1 will work with you to build a plan that gives you the features your need for all of your sites at a price point that will fit within your budget.', $variables),
++        ],
++      ]),
++    ];
++    return $addons;
++  }
++
++  /**
+    * Calculates the monthly subscription cost based on the site limit.
+    *
+    * @param $service_level
+diff --git a/docroot/modules/custom/tag1_stripe/tag1_stripe.libraries.yml b/docroot/modules/custom/tag1_stripe/tag1_stripe.libraries.yml
+index 714e392..c2a64d8 100644
+--- a/docroot/modules/custom/tag1_stripe/tag1_stripe.libraries.yml
++++ b/docroot/modules/custom/tag1_stripe/tag1_stripe.libraries.yml
+@@ -10,3 +10,10 @@ stripe:
+ stripe.external:
+   js:
+     https://checkout.stripe.com/checkout.js: { type: external, minified: false }
++
++stripe.form:
++  js:
++    js/tag1-stripe-form.js: {}
++  dependencies:
++    - core/jquery
++    - core/drupalSettings
+
+From 5599503118b8297079767d287a3c64a9c2699e75 Mon Sep 17 00:00:00 2001
+From: Nathaniel Catchpole <catch@35733.no-reply.drupal.org>
+Date: Mon, 5 Sep 2016 13:01:53 +0100
+Subject: [PATCH 2/4] UP-401: ensure price updates when quantity changes.
+
+---
+ .../modules/custom/tag1_stripe/js/tag1-stripe-form.js    | 16 ++++++++++++++--
+ docroot/modules/custom/tag1_stripe/js/tag1-stripe.js     | 16 +++++++++-------
+ 2 files changed, 23 insertions(+), 9 deletions(-)
+
+diff --git a/docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js b/docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js
+index 774d558..1df459a 100644
+--- a/docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js
++++ b/docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js
+@@ -17,17 +17,26 @@
+           var $this = $(this);
+           var $button = $('.button.stripe');
+           if ($this[0].checked) {
++            // set both html attribute and jquery data. just setting the
++            // attribute does not update jquery's data.
+             $button.attr('data-plan', 'QUO-D6LTS');
++            $button.data('plan','QUO-D6LTS');
+           }
+           else {
++            // set both html attribute and jquery data. just setting the
++            // attribute does not update jquery's data.
+             $button.attr('data-plan', 'QUO-PRO');
++            $button.data('plan','QUO-PRO');
+           }
+           Drupal.behaviors.tag1StripeForm.updatePrice(drupalSettings, $button);
+         });
+         $('.quantity').change(function() {
+           $('.quantity option:selected').each(function() {
+             var $button = $('.button.stripe');
+-            $button.attr('data-quantity', $(this)[0].value);
++            // set both html attribute and jquery data. just setting the
++            // attribute does not update jquery's data.
++            $button.attr('data-quantity', parseInt($(this)[0].value));
++            $button.data('quantity', parseInt($(this)[0].value));
+             Drupal.behaviors.tag1StripeForm.updatePrice(drupalSettings, $button);
+           });
+         });
+@@ -36,7 +45,7 @@
+     updatePrice: function (drupalSettings) {
+       var $button = $('.button.stripe');
+       var plan = $button.attr('data-plan');
+-      var quantity = $button.attr('data-quantity');
++      var quantity = parseInt($button.attr('data-quantity'));
+       // @todo: move prices to drupalSettings.
+       if (plan == 'QUO-PRO') {
+         var price = 1499;
+@@ -44,7 +53,10 @@
+       else {
+         var price = 1499 + 14999;
+       }
++      // set both html attribute and jquery data. just setting the
++      // attribute does not update jquery's data.
+       $button.attr('data-amount', quantity * price);
++      $button.data('amount', parseInt(quantity * price));
+     }
+   }
+ 
+diff --git a/docroot/modules/custom/tag1_stripe/js/tag1-stripe.js b/docroot/modules/custom/tag1_stripe/js/tag1-stripe.js
+index 2fe7f96..e87dc47 100644
+--- a/docroot/modules/custom/tag1_stripe/js/tag1-stripe.js
++++ b/docroot/modules/custom/tag1_stripe/js/tag1-stripe.js
+@@ -31,11 +31,12 @@
+    * @param {Event} e
+    */
+   Tag1StripeHandler.prototype.click = function (e) {
+-    this.$trigger = $(e.target);
++    var $trigger = $(e.target);
++    this.$trigger = $trigger;
+     if (this.$trigger.is('a,:button')) {
+       e.preventDefault();
+     }
+-    this.open();
++    this.open(this.$trigger);
+   };
+ 
+   /**
+@@ -51,30 +52,31 @@
+   /**
+    * Open handler.
+    */
+-  Tag1StripeHandler.prototype.open = function () {
++  Tag1StripeHandler.prototype.open = function ($trigger) {
+     // Reset current objects.
+     this.currentData = {};
+     this.currentOptions = $.extend(true, {}, this.options);
+ 
+     // Determine if a triggering element was provided.
+-    if (this.$trigger && this.$trigger[0]) {
++    if ($trigger && $trigger[0]) {
+       // Disable the trigger.
+-      this.$trigger.attr('disabled', 'disabled').addClass('disabled');
++      $trigger.attr('disabled', 'disabled').addClass('disabled');
+ 
+       // Retrieve the current trigger element data.
+-      this.currentData = this.$trigger.data();
++      console.log($trigger.data());
++      this.currentData = $trigger.data();
+ 
+       // Extend the current options to include certain allowed data options.
+       // This is to prevent Swipe from complaining about "unknown" options as
+       // well as prevent the leakage of unnecessary, potentially sensitive, data.
+       var allowedOptions = ['amount', 'currency', 'description', 'locale', 'name', 'panelLabel'];
+       for (var i in this.currentData) {
+-        if (!this.currentData.hasOwnProperty(i)) continue;
+         if (allowedOptions.indexOf(i) !== -1) {
+           this.currentOptions[i] = this.currentData[i];
+         }
+       }
+     }
++    console.log(this.currentOptions);
+ 
+     // Ensure that a proper callback URL was provided.
+     this.validateCallbackUrl();
+
+From 3aecaffd14d5b8b635a0e6cf846928286f878626 Mon Sep 17 00:00:00 2001
+From: Nathaniel Catchpole <catch@35733.no-reply.drupal.org>
+Date: Mon, 5 Sep 2016 17:51:05 +0100
+Subject: [PATCH 3/4] UP-401: add support for enterprise pricing, clean-up lots
+ of other bits.
+
+---
+ .../custom/tag1_helper/src/UpdatesAccessCheck.php  |   2 +-
+ .../custom/tag1_stripe/js/tag1-stripe-form.js      |  59 +++++--
+ .../src/Controller/StripeController.php            |  58 +++---
+ .../custom/tag1_stripe/src/Tag1StripeHelper.php    | 194 +++++----------------
+ 4 files changed, 128 insertions(+), 185 deletions(-)
+
+diff --git a/docroot/modules/custom/tag1_helper/src/UpdatesAccessCheck.php b/docroot/modules/custom/tag1_helper/src/UpdatesAccessCheck.php
+index c4fd63c..799a7a9 100644
+--- a/docroot/modules/custom/tag1_helper/src/UpdatesAccessCheck.php
++++ b/docroot/modules/custom/tag1_helper/src/UpdatesAccessCheck.php
+@@ -26,7 +26,7 @@ class UpdatesAccessCheck implements AccessInterface {
+   public function access(AccountInterface $account) {
+     if ($account->id()) {
+       $account = User::load($account->id());
+-      if (Tag1PartnerHelper::hasCustomerServiceLevelNone($account) || Tag1PartnerHelper::hasCustomerServiceLevelBasic($account)) {
++      if (Tag1PartnerHelper::hasCustomerServiceLevelNone($account)) {
+         $access_result = AccessResult::forbidden();
+         $access_result->cachePerUser();
+         return $access_result;
+diff --git a/docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js b/docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js
+index 1df459a..6b278d1 100644
+--- a/docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js
++++ b/docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js
+@@ -13,20 +13,48 @@
+     attach: function (drupalSettings, context) {
+       // Only bind once.
+       $('body').once('stripe-form').each(function () {
++        var $button = $('.button.stripe');
++        var $enterprise = $('.enterprise');
++
++        // The default status of the checkbox depends on query parameter so
++        // populate button data attribute on page load as well as click event.
++        if ($enterprise[0].checked) {
++          $button.attr('data-enterprise', 1);
++          $button.data('enterprise', 1);
++        }
++        else {
++          $button.attr('data-enterprise', 0);
++          $button.data('enterprise', 0);
++        }
++        $enterprise.click(function() {
++          var $button = $('.button.stripe');
++          var $this = $(this);
++          if ($this[0].checked) {
++            $button.attr('data-enterprise', 1);
++            $button.data('enterprise', 1);
++          }
++          else {
++            $button.attr('data-enterprise', 0);
++            $button.data('enterprise', 0);
++          }
++        });
++
+         $('.lts').click(function() {
++        var $button = $('.button.stripe');
+           var $this = $(this);
+-          var $button = $('.button.stripe');
+           if ($this[0].checked) {
+             // set both html attribute and jquery data. just setting the
+             // attribute does not update jquery's data.
+-            $button.attr('data-plan', 'QUO-D6LTS');
+-            $button.data('plan','QUO-D6LTS');
++            $button.attr('data-plan', 'lts');
++            $button.data('plan','lts');
++            $('li.lts').show();
+           }
+           else {
+             // set both html attribute and jquery data. just setting the
+             // attribute does not update jquery's data.
+-            $button.attr('data-plan', 'QUO-PRO');
+-            $button.data('plan','QUO-PRO');
++            $button.attr('data-plan', 'quo');
++            $button.data('plan','quo');
++            $('li.lts').hide();
+           }
+           Drupal.behaviors.tag1StripeForm.updatePrice(drupalSettings, $button);
+         });
+@@ -46,17 +74,28 @@
+       var $button = $('.button.stripe');
+       var plan = $button.attr('data-plan');
+       var quantity = parseInt($button.attr('data-quantity'));
++      var enterprise = parseInt($button.attr('data-enterprise'));
+       // @todo: move prices to drupalSettings.
+-      if (plan == 'QUO-PRO') {
+-        var price = 1499;
++      if (plan == 'quo') {
++        var site_price = 1499;
+       }
+       else {
+-        var price = 1499 + 14999;
++        if (enterprise) {
++          var site_price = 1499 + 2599;
++        }
++        else {
++          var site_price = 1499 + 14999;
++        }
++      }
++      var price = site_price * quantity;
++      if (enterprise) {
++        price = price + 52499;
+       }
++      console.log(price);
+       // set both html attribute and jquery data. just setting the
+       // attribute does not update jquery's data.
+-      $button.attr('data-amount', quantity * price);
+-      $button.data('amount', parseInt(quantity * price));
++      $button.attr('data-amount', price);
++      $button.data('amount', price);
+     }
+   }
+ 
+diff --git a/docroot/modules/custom/tag1_stripe/src/Controller/StripeController.php b/docroot/modules/custom/tag1_stripe/src/Controller/StripeController.php
+index 9a70b08..43999b0 100644
+--- a/docroot/modules/custom/tag1_stripe/src/Controller/StripeController.php
++++ b/docroot/modules/custom/tag1_stripe/src/Controller/StripeController.php
+@@ -43,7 +43,7 @@ public function __construct(Tag1StripeHelper $helper) {
+   /**
+    * Callback to display info and the stripe payment buttons.
+    */
+-  public function payment() {
++  public function payment(Request $request) {
+     $current_user = $this->currentUser();
+ 
+     // Redirect the user now if they already have a service level.
+@@ -73,18 +73,29 @@ public function payment() {
+         'label' => $this->t('Monitoring'),
+         'description' => $this->t('@site-name actively monitors your site for any security vulnerabilities. By comparing information about your site to a known set of security advisories, you can be assured that we\'re finding all known vulnerabilities.', $variables),
+       ],
+-      'security_dashboard' => [
++      'security-dashboard' => [
+         'label' => $this->t('Security Dashboard'),
+         'description' => $this->t('No matter if you\'re monitoring a single site, or several hundred. @site-name provides a convenient and centralized security dashboard where you can quickly understand your security status and take action to address issues.', $variables),
++        ],
++      'lts' => [
++        'label' => $this->t('Long term support'),
++        'description' => $this->t("As a part of the Drupal Security Team, Tag1's expert staff is constantly working to assess and address new security issues. When we find something that affects one of our customers, we develop a solution in tandem with the Drupal community. We are committed to providing support for every project on drupal.org that is used by our customers.", $variables),
++      ],
++      'deployment' => [
++        'label' => $this->t('Deployment Assistance'),
++        'description' => $this->t('Management of a major security deployment can be a challenge for customers with many sites or particularly complex ones. Users of @site-name\'s enterprise plan can work with our team of experts to get engineering assistance to help them understand what their security needs are, gain insight into deployment best practices, and have a team of experts available to help.', $variables),
++      ],
++      'pricing' => [
++        'label' => $this->t('Special Pricing for Multiple Sites'),
++        'description' => $this->t('We understand that many companies have chosen unique and powerful ways of scaling Drupal as a platform for dozens, hundreds, or even thousands of sites. Tag1 will work with you to build a plan that gives you the features your need for all of your sites at a price point that will fit within your budget.', $variables),
+       ],
+-
+     ];
+     $build['features'] = [
+       '#theme' => 'item_list__plan__features',
+       '#items' => $this->buildFeatureList($feature_data),
+       ];
+ 
+-    $range = range(0, 3);
++    $range = range(0, 200);
+     unset($range[0]);
+ 
+     $build['sites'] = [
+@@ -97,19 +108,23 @@ public function payment() {
+       '#type' => 'html_tag',
+       '#tag' => 'span',
+       // @todo: link.
+-      '#value' => $this->t('More than three sites? Go enterprise'),
++      '#value' => $this->t('Four or more sites? Go enterprise'),
+     ];
+     $build['lts'] = [
+       '#type' => 'checkbox',
+-      '#title' => $this->t('Add Drupal 6 LTS'),
+-      '#attributes' => ['class' => ['lts']],
++      '#title' => $this->t('Include Drupal 6 LTS'),
++      '#attributes' => ['class' => ['lts'], 'checked' => 'checked'],
+     ];
+-    $build['lts_description'] = [
+-      '#type' => 'html_tag',
+-      '#tag' => 'span',
+-      '#attributes' => ['lts-description'],
+-      '#value' => $this->t("As a part of the Drupal Security Team, Tag1's expert staff is constantly working to assess and address new security issues. When we find something that affects one of our customers, we develop a solution in tandem with the Drupal community. We are committed to providing support for every project on drupal.org that is used by our customers.", $variables),
++
++    $build['enterprise'] = [
++      '#type' => 'checkbox',
++      '#title' => $this->t('Include Enterprise support'),
++      '#attributes' => ['class' => ['enterprise']],
+     ];
++    if ($request->query->get('enterprise')) {
++      $build['enterprise']['#attributes']['checked'] = 'checked';
++      $build['enterprise']['#wrapper_attributes']['class'][] = 'visually-hidden';
++    }
+     // Anonymous users just get a link to sign in or create an account.
+     if ($current_user->isAnonymous()) {
+       $build['action'] = [
+@@ -128,8 +143,8 @@ public function payment() {
+         '#attributes' => [
+           'data-tag1-stripe' => 'true',
+           'data-callback-url' => Url::fromRoute('tag1_stripe.charge')->toString(),
+-          'data-plan' => 'QUO-PRO',
+-          'data-amount' => 1499,
++          'data-plan' => $this->stripeHelper::LTS,
++          'data-amount' => 1499 + 14999,
+           'data-quantity' => 1,
+           'data-description' => $this->t('@label subscription', ['@label' => $this->t('Tag1 Quo')]),
+           'data-panel-label' => $this->t('Subscribe ({{amount}}/month)'),
+@@ -149,10 +164,10 @@ public function payment() {
+    * Build an #items array given a features array.
+    */
+   protected function buildFeatureList($feature_data) {
+-    foreach ($feature_data as $feature) {
++    foreach ($feature_data as $key => $feature) {
+       $features[] = [
+         '#wrapper_attributes' => [
+-          'class' => ['feature'],
++          'class' => ['feature', $key],
+           'title' => $feature['description'],
+         ],
+         '#type' => 'html_tag',
+@@ -169,21 +184,20 @@ protected function buildFeatureList($feature_data) {
+   public function charge(Request $request) {
+     // @todo Should we make sure users hitting this don't already have a service
+     // level? just in case?
+-    $request_params = $request->request;
+-
+     $current_user = User::load($this->currentUser()->id());
+-    $plan = $request_params->get('plan');
+-    $quantity = $request_params->get('quantity');
++    $plan = $request->request->get('plan');
++    $quantity = $request->request->get('quantity');
++    $enterprise = $request->request->get('enterprise');
+ 
+     try {
+-      $customer = $this->stripeHelper->createNewCustomerAndSubscription($request_params->get('stripeToken'), $plan, $current_user, $quantity);
++      $customer = $this->stripeHelper->createNewCustomerAndSubscription($request->request->get('stripeToken'), $plan, $current_user, $quantity, $enterprise);
+ 
+       // Set the service level and stripe customer ID.
+       Tag1PartnerHelper::setCustomerStripeId($current_user, $customer->id);
+ 
+       Tag1PartnerHelper::setCustomerServiceLevel($current_user, 'pro');
+ 
+-      drupal_set_message($this->t('Thank You for buying %level.', ['%level' => $service_level_info['label']]));
++      drupal_set_message($this->t('Thank you for subscribing to Tag1 Quo'));
+ 
+       return $this->redirect('<front>');
+     }
+diff --git a/docroot/modules/custom/tag1_stripe/src/Tag1StripeHelper.php b/docroot/modules/custom/tag1_stripe/src/Tag1StripeHelper.php
+index e05cf80..de44dd6 100644
+--- a/docroot/modules/custom/tag1_stripe/src/Tag1StripeHelper.php
++++ b/docroot/modules/custom/tag1_stripe/src/Tag1StripeHelper.php
+@@ -14,6 +14,7 @@
+ use Stripe\Customer;
+ use Stripe\Event;
+ use Stripe\Stripe;
++use Stripe\Subscription;
+ use Symfony\Component\DependencyInjection\ContainerInterface;
+ use Symfony\Component\HttpFoundation\Request;
+ use Symfony\Component\HttpKernel\Exception\BadRequestHttpException;
+@@ -25,6 +26,16 @@ class Tag1StripeHelper {
+ 
+   use StringTranslationTrait;
+ 
++  const SITE = 'QUO-SITE';
++
++  const LTS = 'QUO-LTS';
++
++  const ENTERPRISESITE = 'QUO-SITE-ENTERPRISE';
++
++  const ENTERPRISELTS = 'QUO-LTS-ENTERPRISE';
++
++  const ENTERPRISE_PLAN = 'QUO-ENTERPRISE';
++
+   /**
+    * @var \Drupal\Core\Site\Settings
+    */
+@@ -75,171 +86,50 @@ public function getSetting($key) {
+   }
+ 
+   /**
+-   * @return array
+-   */
+-  public function getAllServiceLevelData() {
+-    $variables = ['@site-name' => \Drupal::config('system.site')->get('name')];
+-
+-    $plans['pro'] = [
+-      'plan' => 'QUO-PRO',
+-      'label' => $this->t('Quo Pro'),
+-      'description' => $this->t('Our entry level offering. Be notified of all security issues fixed for our D6 LTS customers that also affect your Drupal 6 website.'),
+-      'amount' => 1499,
+-      'addons' =>  [
+-        'D6LTS',
+-        'ENTERPRISE',
+-      ],
+-      'features' => [
+-        'notifications' => [
+-          'label' => $this->t('Notifications'),
+-          'description' => $this->t('You can feel confident that you\'ll receive up-to-date information about any security advisories that affect your site(s). @site-name has configurable email notifications and up-to-the-minute status alerts via the Security Dashboard.', $variables),
+-        ],
+-        'monitoring' => [
+-          'label' => $this->t('Monitoring'),
+-          'description' => $this->t('@site-name actively monitors your site for any security vulnerabilities. By comparing information about your site to a known set of security advisories, you can be assured that we\'re finding all known vulnerabilities.', $variables),
+-        ],
+-        'security_dashboard' => [
+-          'label' => $this->t('Security Dashboard'),
+-          'description' => $this->t('No matter if you\'re monitoring a single site, or several hundred. @site-name provides a convenient and centralized security dashboard where you can quickly understand your security status and take action to address issues.', $variables),
+-        ],
+-      ],
+-    ];
+-
+-    /**
+-
+-    $plans['pro_old'] = [
+-      'plan' => 'QUO-PRO',
+-      'label' => $this->t('Quo Pro'),
+-      'description' => $this->t('Includes Drupal 6 Long Term Support and an interactive management portal. Ensure that all your Drupal 6 modules are secure!'),
+-      'amount' => 14999,
+-      'features' => array_merge($plans['basic']['features'], [
+-        'patch_development' => [
+-          'label' => $this->t('Patch Development'),
+-          'description' => $this->t('As a part of the Drupal Security Team, Tag1\'s expert staff is constantly working to assess and address new security issues. When we find something that affects one of our customers, we develop a solution in tandem with the Drupal community. We are committed to providing support for every project on drupal.org that is used by our customers.', $variables),
+-        ],
+-        'security_dashboard' => [
+-          'label' => $this->t('Security Dashboard'),
+-          'description' => $this->t('No matter if you\'re monitoring a single site, or several hundred. @site-name provides a convenient and centralized security dashboard where you can quickly understand your security status and take action to address issues.', $variables),
+-        ],
+-      ]),
+-    ];
+-*/
+-/**
+-    $plans['enterprise'] = [
+-      'plan' => 'QUO-ENTERPRISE',
+-      'label' => $this->t('Quo Enterprise'),
+-      'description' => $this->t('Our most comprehensive solution, offering total peace of mind knowing that our team is monitoring your site for you and ensuring you are up to date!'),
+-      'amount' => 59999,
+-      'features' => array_merge($plans['pro']['features'], [
+-        'deployment_assistance' => [
+-          'label' => $this->t('Deployment Assistance'),
+-          'description' => $this->t('Management of a major security deployment can be a challenge for customers with many sites or particularly complex ones. Users of @site-name\'s enterprise plan can work with our team of experts to get engineering assistance to help them understand what their security needs are, gain insight into deployment best practices, and have a team of experts available to help.', $variables),
+-        ],
+-        'special_pricing' => [
+-          'label' => $this->t('Special Pricing for Multiple Sites'),
+-          'description' => $this->t('We understand that many companies have chosen unique and powerful ways of scaling Drupal as a platform for dozens, hundreds, or even thousands of sites. Tag1 will work with you to build a plan that gives you the features your need for all of your sites at a price point that will fit within your budget.', $variables),
+-        ],
+-      ]),
+-    ];
+-
+-*/
+-
+-    return $plans;
+-  }
+-
+-  /**
+-   * Returns data for a single service level.
+-   *
+-   * @param $service_level
+-   *
+-   * @return mixed|null
+-   */
+-  public function getServiceLevelData($service_level) {
+-    $all_data = $this->getAllServiceLevelData();
+-    return isset($all_data[$service_level]) ? $all_data[$service_level] : NULL;
+-  }
+-
+-  /**
+-   * Get addons.
+-   */
+-  public function getAddOns() {
+-    $variables = ['@site-name' => \Drupal::config('system.site')->get('name')];
+-    $addons['D6LTS'] = [
+-      'label' => $this->t('Drupal 6 LTS'),
+-      'price' => 14999,
+-      'features' => [
+-        'patch_development' => [
+-          'label' => $this->t('Patch Development'),
+-          'description' => $this->t('As a part of the Drupal Security Team, Tag1\'s expert staff is constantly working to assess and address new security issues. When we find something that affects one of our customers, we develop a solution in tandem with the Drupal community. We are committed to providing support for every project on drupal.org that is used by our customers.', $variables),
+-        ],
+-      ],
+-    ];
+-    $addons['D6LTS_ENTERPRISE'] = [
+-      'label' => $this->t('Drupal 6 LTS Enterprise'),
+-      'price' => 59999,
+-      'features' => array_merge($plans['pro']['features'], [
+-        'deployment_assistance' => [
+-          'label' => $this->t('Deployment Assistance'),
+-          'description' => $this->t('Management of a major security deployment can be a challenge for customers with many sites or particularly complex ones. Users of @site-name\'s enterprise plan can work with our team of experts to get engineering assistance to help them understand what their security needs are, gain insight into deployment best practices, and have a team of experts available to help.', $variables),
+-        ],
+-        'special_pricing' => [
+-          'label' => $this->t('Special Pricing for Multiple Sites'),
+-          'description' => $this->t('We understand that many companies have chosen unique and powerful ways of scaling Drupal as a platform for dozens, hundreds, or even thousands of sites. Tag1 will work with you to build a plan that gives you the features your need for all of your sites at a price point that will fit within your budget.', $variables),
+-        ],
+-      ]),
+-    ];
+-    return $addons;
+-  }
+-
+-  /**
+-   * Calculates the monthly subscription cost based on the site limit.
+-   *
+-   * @param $service_level
+-   * @param int $site_limit
+-   */
+-  public function calculateMonthlySubscriptionCost($service_level, $site_limit = 1) {
+-    $service_level_data = $this->getServiceLevelData($service_level);
+-
+-    if (!$service_level_data) {
+-      return 0;
+-    }
+-
+-    $amount = ($service_level_data['amount']) * $site_limit;
+-
+-    return $amount;
+-  }
+-
+-  /**
+-   * Returns a formatted monthly subscription cost string. E.g. '$14.99'
+-   *
+-   * This is converted from the raw cents amount.
+-   *
+-   * @param string $service_level
+-   * @param int $site_limit
+-   *
+-   * @return string
+-   */
+-  public function formatMonthlySubscriptionCost($service_level, $site_limit = 1) {
+-    $raw_cost = $this->calculateMonthlySubscriptionCost($service_level, $site_limit);
+-    return '$' . number_format($raw_cost / 100, 2);
+-  }
+-
+-  /**
+    * Creates a new user and subscription in stripe.
+    */
+-  public function createNewCustomerAndSubscription($stripe_token, $service_level, $account, $quantity = 1) {
++  public function createNewCustomerAndSubscription($stripe_token, $service_level, $account, $quantity = 1, $enterprise = FALSE) {
+     if ($customer = $this->loadCustomerAndSubscription($account)) {
+       return $customer;
+     }
++
++
++    // Plan may be either quo or LTS with enterprise variants.
++    if ($service_level === 'quo') {
++      $plan = $enterprise ? static::ENTERPRISESITE : static::SITE;
++    }
++    else {
++      $plan = $enterprise ? static::ENTERPRISELTS : static::LTS;
++    }
++
+     $customer = Customer::create([
+       'source' => $stripe_token,
+-      'plan' => $service_level,
++      'plan' => $plan,
+       'email' => $account->getEmail(),
+       'quantity' => $quantity,
+       'metadata' => [
+         'uid' => $account->id(),
+       ],
+     ]);
++    if ($plan === static::LTS || $plan === static::ENTERPRISELTS) {
++      // The subscription created above will be for LTS, but each LTS
++      // subscription also needs a site subscription, so create those now.
++      $site_plan = $enterprise ? static::ENTERPRISESITE : static::SITE;
++
++      Subscription::create([
++        'customer' => $customer->id,
++        'plan' => $site_plan,
++        'quantity' => $quantity,
++      ]);
++    }
++    // Enterprise customers also pay for a per-account enterprise subscription.
++    if ($enterprise) {
++      Subscription::create([
++        'customer' => $customer->id,
++        'plan' => static::ENTERPRISE_PLAN,
++        'quantity' => 1,
++      ]);
++    }
+ 
+     return $customer;
+   }
+
+From b1d1a0a86a44622ae2dacc6487cd4ae2940270dd Mon Sep 17 00:00:00 2001
+From: Nathaniel Catchpole <catch@35733.no-reply.drupal.org>
+Date: Mon, 5 Sep 2016 19:07:04 +0100
+Subject: [PATCH 4/4] UP-401: hide/show enterprise features.
+
+---
+ docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js b/docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js
+index 6b278d1..64f8367 100644
+--- a/docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js
++++ b/docroot/modules/custom/tag1_stripe/js/tag1-stripe-form.js
+@@ -25,6 +25,8 @@
+         else {
+           $button.attr('data-enterprise', 0);
+           $button.data('enterprise', 0);
++          $('li.deployment').hide();
++          $('li.pricing').hide();
+         }
+         $enterprise.click(function() {
+           var $button = $('.button.stripe');
+@@ -32,10 +34,14 @@
+           if ($this[0].checked) {
+             $button.attr('data-enterprise', 1);
+             $button.data('enterprise', 1);
++            $('li.deployment').show();
++            $('li.pricing').show();
+           }
+           else {
+             $button.attr('data-enterprise', 0);
+             $button.data('enterprise', 0);
++            $('li.deployment').hide();
++            $('li.pricing').hide();
+           }
+         });
+ 
